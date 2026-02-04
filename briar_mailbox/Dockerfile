@@ -1,24 +1,38 @@
-ARG BUILD_FROM
+# Home Assistant provides BUILD_FROM automatically.
+# Give it a safe default so buildkit doesn't warn when linting/parsing.
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:latest
 
-# ---------- Build stage ----------
-FROM openjdk:17-jdk-slim AS builder
-WORKDIR /build
+# -------- Build stage (compile fat JAR) --------
+FROM ${BUILD_FROM} AS builder
 
-RUN apt-get update && apt-get install -y git
-
-RUN git clone https://code.briarproject.org/briar/briar-mailbox.git .
-RUN ./gradlew x86LinuxJar
-
-# ---------- Runtime stage ----------
-FROM $BUILD_FROM
-
-RUN apk add --no-cache openjdk17-jre ca-certificates \
+RUN apk add --no-cache \
+    bash \
+    git \
+    openjdk17-jdk \
+    unzip \
+    ca-certificates \
   && update-ca-certificates
 
-WORKDIR /data
+WORKDIR /build
+
+# Clone upstream source
+RUN git clone --depth=1 https://code.briarproject.org/briar/briar-mailbox.git .
+
+# Build the x86_64 Linux fat JAR
+RUN ./gradlew --no-daemon x86LinuxJar
+
+# -------- Runtime stage --------
+FROM ${BUILD_FROM}
+
+RUN apk add --no-cache \
+    bash \
+    openjdk17-jre \
+    ca-certificates \
+  && update-ca-certificates
 
 COPY --from=builder /build/build/libs/*x86_64*.jar /app/briar-mailbox.jar
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 
-CMD ["/run.sh"]
+WORKDIR /data
+CMD [ "/run.sh" ]

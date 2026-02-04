@@ -1,0 +1,24 @@
+name: "Briar Mailbox"
+slug: "briar_mailbox"
+version: "0.1.0"
+description: "Briar Mailbox Server CLI packaged as a Home Assistant add-on."
+url: "https://code.briarproject.org/briar/briar-mailbox"
+
+arch:
+  - amd64
+
+startup: services
+init: false
+
+# Web UI inside Home Assistant (so QR code is visible in HA + Companion App)
+ingress: true
+ingress_port: 8080
+ingress_entry: /
+
+panel_icon: mdi:qrcode
+
+# Optional: keep the web UI accessible only through Ingress (recommended)
+ports:
+  8080/tcp: null
+ports_description:
+  8080/tcp: "Briar Mailbox web UI (Ingress)"

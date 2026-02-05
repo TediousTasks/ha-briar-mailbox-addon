@@ -6,8 +6,6 @@ LOG="/tmp/briar.log"
 HTTP_LOG="/tmp/http.log"
 
 INDEX="${DATA_DIR}/index.html"
-QR_TXT="${DATA_DIR}/mailbox.txt"
-QR_ASCII="${DATA_DIR}/qr_ascii.txt"
 STATUS_TXT="${DATA_DIR}/status.txt"
 BRIAR_TAIL="${DATA_DIR}/briar_tail.txt"
 CONTROL_LOG="${DATA_DIR}/control.log"
@@ -16,20 +14,17 @@ CONNECTED_FLAG="${DATA_DIR}/connected"
 RESET_FLAG="${DATA_DIR}/reset"
 
 mkdir -p "$DATA_DIR"
+touch "$CONTROL_LOG"
 
 # Force Briar to use /data (not /root)
 export HOME=/data
 export XDG_DATA_HOME=/data/.local/share
 export XDG_CONFIG_HOME=/data/.config
 export XDG_CACHE_HOME=/data/.cache
-
 mkdir -p /data/.local/share /data/.config /data/.cache
 
 : > "$LOG"
-: > "$QR_TXT"
-: > "$QR_ASCII"
 : > "$BRIAR_TAIL"
-touch "$CONTROL_LOG"
 echo "STARTING" > "$STATUS_TXT"
 
 log() {
@@ -58,6 +53,44 @@ dump_data_tree_to_control() {
   } >> "$CONTROL_LOG"
 }
 
+# IMPORTANT: don’t ever block forever trying to stop Java.
+stop_briar_hard() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 0
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    log "Stop: Briar PID $pid not running."
+    return 0
+  fi
+
+  log "Stop: sending SIGTERM to $pid..."
+  kill "$pid" 2>/dev/null || true
+
+  # wait up to 5 seconds
+  for _ in $(seq 1 10); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      log "Stop: PID $pid exited after SIGTERM."
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  log "Stop: still running; sending SIGKILL to $pid..."
+  kill -9 "$pid" 2>/dev/null || true
+
+  # wait up to 5 more seconds
+  for _ in $(seq 1 10); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      log "Stop: PID $pid exited after SIGKILL."
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  log "Stop: WARNING: PID $pid still appears alive after SIGKILL (unexpected). Continuing anyway."
+  return 0
+}
+
 hard_wipe_data_dir_except_ui() {
   log "RESET: dumping /data BEFORE wipe..."
   dump_data_tree_to_control
@@ -66,20 +99,16 @@ hard_wipe_data_dir_except_ui() {
   echo "RESETTING" > "$STATUS_TXT"
 
   rm -f "$CONNECTED_FLAG" 2>/dev/null || true
-  : > "$QR_TXT"
-  : > "$QR_ASCII"
   : > "$LOG"
   update_briar_tail
 
-  # Preserve allowlist: index.html, status.txt, briar_tail.txt, control.log
-  # Delete everything else (including hidden). Use find prune to be explicit.
   : > /tmp/reset_rm_err.log
 
+  # Preserve allowlist: index.html, status.txt, briar_tail.txt, control.log
   find /data -mindepth 1 \
     \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/briar_tail.txt" -o -path "/data/control.log" \) -prune -o \
     -exec rm -rf {} + 2>>/tmp/reset_rm_err.log || true
 
-  # Verify leftovers (excluding allowlist)
   leftover="$(find /data -mindepth 1 \
     \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/briar_tail.txt" -o -path "/data/control.log" \) -prune -o \
     -print | head -n 200 || true)"
@@ -92,15 +121,14 @@ hard_wipe_data_dir_except_ui() {
       sed -n '1,200p' /tmp/reset_rm_err.log >> "$CONTROL_LOG" || true
     fi
   else
-    log "RESET: wipe verification PASSED (no leftovers besides UI allowlist)."
+    log "RESET: wipe verification PASSED."
   fi
 
-  # Recreate dirs Briar expects
+  # Recreate dirs Briar expects (since we wipe hard)
   mkdir -p /data/.local/share /data/.config /data/.cache
 
-  : > "$QR_TXT"
-  : > "$QR_ASCII"
   : > "$LOG"
+  : > "$BRIAR_TAIL"
   update_briar_tail
 
   log "RESET: dumping /data AFTER wipe..."
@@ -125,61 +153,57 @@ cat > "$INDEX" <<'HTML'
     .muted { color:#666; }
     .card { border:1px solid #ddd; border-radius:12px; padding:16px; background:#fff; }
     pre { white-space: pre; overflow-x:auto; background:#f7f7f7; border:1px solid #ddd; border-radius:8px; padding:12px; }
-    code { word-break: break-all; display:block; padding:12px; border:1px solid #ccc; border-radius:8px; background:#f7f7f7; }
     .ok { display:inline-block; padding:6px 10px; border-radius:999px; background:#e9f7ef; border:1px solid #bfe8cf; }
     .warn { display:inline-block; padding:6px 10px; border-radius:999px; background:#fff6e5; border:1px solid #ffe0a3; }
     .btn { display:inline-block; padding:10px 12px; border:1px solid #ccc; border-radius:10px; background:#f7f7f7; text-decoration:none; color:#000; cursor:pointer; }
     .btn-danger { border-color:#f1b0b7; background:#fff0f2; }
     .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-    h3 { margin-top: 18px; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h2>Briar Mailbox</h2>
-    <p class="muted">No auto-refresh. Click Refresh. Reset forces a new pairing.</p>
+    <p class="muted">Refresh to update. Reset forces a new pairing state by wiping /data.</p>
 
     <div class="card">
       <div class="row">
         <div id="stateTag" class="warn">Loading…</div>
         <a class="btn" href="./">Refresh</a>
-        <a class="btn btn-danger" href="reset" id="resetLink">Reset mailbox (force re-pair)</a>
+        <a class="btn btn-danger" href="reset" id="resetLink">Reset</a>
       </div>
 
       <h3>Control log</h3>
       <pre id="ctl">(loading...)</pre>
 
       <h3>Briar log tail</h3>
-      <pre id="logtail">(loading...)</pre>
+      <pre id="tail">(loading...)</pre>
     </div>
 
     <script>
       document.getElementById("resetLink").addEventListener("click", (e) => {
-        if (!confirm("Reset mailbox now? This will require pairing again.")) e.preventDefault();
+        if (!confirm("Reset now? This wipes /data state and requires pairing again.")) e.preventDefault();
       });
 
       async function loadText(path) {
         const r = await fetch(path, { cache: 'no-store' });
         if (!r.ok) throw new Error(path + " " + r.status);
-        return (await r.text());
+        return await r.text();
       }
 
       (async () => {
         let status = "STARTING";
         try { status = (await loadText("status.txt")).trim(); } catch {}
-
-        const s = (status || "").toUpperCase();
         const tag = document.getElementById("stateTag");
+        const s = (status || "").toUpperCase();
         if (s.startsWith("CONNECTED")) { tag.className="ok"; tag.textContent="CONNECTED"; }
-        else if (s.startsWith("PAIRING")) { tag.className="warn"; tag.textContent="PAIRING"; }
         else if (s.startsWith("RESETTING")) { tag.className="warn"; tag.textContent="RESETTING"; }
         else { tag.className="warn"; tag.textContent = status || "RUNNING"; }
 
         try { document.getElementById("ctl").textContent = (await loadText("control.log")).trim() || "(empty)"; }
         catch { document.getElementById("ctl").textContent="(error loading control.log)"; }
 
-        try { document.getElementById("logtail").textContent = (await loadText("briar_tail.txt")).trim() || "(empty)"; }
-        catch { document.getElementById("logtail").textContent="(error loading briar_tail.txt)"; }
+        try { document.getElementById("tail").textContent = (await loadText("briar_tail.txt")).trim() || "(empty)"; }
+        catch { document.getElementById("tail").textContent="(error loading briar_tail.txt)"; }
       })();
     </script>
   </div>
@@ -238,16 +262,8 @@ start_briar
 while true; do
   if consume_reset_request; then
     log "RESET: request consumed; stopping Briar..."
-    set +e
-    kill "$BriarPID" 2>/dev/null
-    wait "$BriarPID" 2>/dev/null
-    set -e
-
-    # Make reset path very loud
-    log "RESET: entering wipe function (set -x enabled for reset only)."
-    set -x
+    stop_briar_hard "$BriarPID"
     hard_wipe_data_dir_except_ui
-    set +x
     log "RESET: restarting Briar..."
     start_briar
   fi

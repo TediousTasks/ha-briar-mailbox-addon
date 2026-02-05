@@ -51,6 +51,7 @@ fix_data_permissions() {
   chmod 755 /data 2>/dev/null || true
   chmod 700 /data/.config /data/.cache 2>/dev/null || true
   chmod -R u+rwX /data/.local 2>/dev/null || true
+  log "Perms: ensured /data owned by ${uid}:${gid} and writable."
 }
 
 kill_orphan_tor() {
@@ -111,7 +112,7 @@ wipe_data_dir_preserve_ui() {
   : > "$QR_ASCII"
   : > "$QR_TXT"
 
-  # Remove everything except the UI/status artifacts
+  log "RESET: wiping /data (preserve UI files only)..."
   find /data -mindepth 1 \
     \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/qr_ascii.txt" -o -path "/data/mailbox.txt" -o -path "/data/boot_ts" \) -prune -o \
     -exec rm -rf {} + || true
@@ -131,6 +132,8 @@ extract_ascii_qr() {
     inside==1 {print}
   ' "$LOG" > "$QR_ASCII" 2>/dev/null || true
 
+  # Strip only leading/trailing completely blank lines.
+  # DO NOT trim per-line leading spaces (quiet zone).
   python - <<'PY'
 from pathlib import Path
 p = Path("/data/qr_ascii.txt")
@@ -175,7 +178,6 @@ write_status() {
 # Only consume reset if it was created AFTER this boot marker
 consume_reset_request() {
   [[ -f "$RESET_FLAG" ]] || return 1
-  # If reset file is older than boot mark, ignore it (stale)
   if [[ "$RESET_FLAG" -ot "$BOOT_MARK" ]]; then
     rm -f "$RESET_FLAG" 2>/dev/null || true
     return 1
@@ -198,7 +200,7 @@ cat > "$INDEX" <<'HTML'
     .wrap { max-width: 760px; margin: 0 auto; }
     .muted { color:#666; }
     .card { border:1px solid #ddd; border-radius:12px; padding:16px; background:#fff; }
-    pre { white-space: pre; overflow-x:auto; background:#f7f7f7; border:1px solid #ddd; border-radius:8px; padding:12px; }
+    pre { white-space: pre; overflow-x:auto; background:#f7f7f7; border:1px solid #ddd; border-radius:8px; padding:12px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
     code { word-break: break-all; display:block; padding:12px; border:1px solid #ddd; border-radius:8px; background:#f7f7f7; }
     .tag { display:inline-block; padding:6px 10px; border-radius:999px; border:1px solid #ddd; background:#f7f7f7; }
     .tag.ok { background:#e9f7ef; border-color:#bfe8cf; }
@@ -250,15 +252,23 @@ cat > "$INDEX" <<'HTML'
         if (!confirm("Reset now? This wipes /data and requires pairing again.")) e.preventDefault();
       });
 
-      async function loadText(path) {
+      // Trim helper for things like mailbox URL
+      async function loadTextTrim(path) {
         const r = await fetch(path, { cache: 'no-store' });
         if (!r.ok) throw new Error(path + " " + r.status);
         return (await r.text()).trim();
       }
 
+      // RAW loader: do NOT trim, preserves leading spaces (quiet zone) so QR stays aligned
+      async function loadTextRaw(path) {
+        const r = await fetch(path, { cache: 'no-store' });
+        if (!r.ok) throw new Error(path + " " + r.status);
+        return await r.text();
+      }
+
       (async () => {
         let status = "STARTING";
-        try { status = await loadText("status.txt"); } catch {}
+        try { status = await loadTextTrim("status.txt"); } catch {}
 
         const tag = document.getElementById("stateTag");
         const connected = document.getElementById("connectedBlock");
@@ -287,10 +297,15 @@ cat > "$INDEX" <<'HTML'
           tag.textContent = "PAIRING";
           show("pairing");
 
-          try { document.getElementById("ascii").textContent = await loadText("qr_ascii.txt") || "(waiting...)"; }
-          catch { document.getElementById("ascii").textContent = "(error loading qr_ascii.txt)"; }
+          // ASCII must be RAW to preserve left padding on line 1
+          try {
+            const raw = await loadTextRaw("qr_ascii.txt");
+            document.getElementById("ascii").textContent = raw && raw.trim().length ? raw.replace(/\s+$/,"") : "(waiting...)";
+          } catch {
+            document.getElementById("ascii").textContent = "(error loading qr_ascii.txt)";
+          }
 
-          try { document.getElementById("link").textContent = await loadText("mailbox.txt") || "(waiting...)"; }
+          try { document.getElementById("link").textContent = await loadTextTrim("mailbox.txt") || "(waiting...)"; }
           catch { document.getElementById("link").textContent = "(error loading mailbox.txt)"; }
 
           return;

@@ -4,38 +4,37 @@ set -euo pipefail
 DATA_DIR="/data"
 QR_PNG="${DATA_DIR}/qr.png"
 QR_TXT="${DATA_DIR}/mailbox.txt"
+LOG="/tmp/briar.log"
+INDEX="${DATA_DIR}/index.html"
 
 mkdir -p "$DATA_DIR"
+: > "$LOG"
 
 # Start Briar mailbox and tee output so we can parse it
-# Adjust this command to whatever you're using to start the mailbox:
-# (example shown as mailbox-cli.jar)
-java -jar /app/briar-mailbox.jar 2>&1 | tee /tmp/briar.log &
+java -jar /app/briar-mailbox.jar 2>&1 | tee "$LOG" &
 BriarPID=$!
 
 # Wait until the briar-mailbox:// line appears
 echo "Waiting for briar-mailbox URL..."
-for i in $(seq 1 120); do
-  if grep -qE '^briar-mailbox://' /tmp/briar.log; then
+for i in $(seq 1 180); do
+  if grep -qE '^briar-mailbox://' "$LOG"; then
     break
   fi
   sleep 1
 done
 
-MAILBOX_URL="$(grep -E '^briar-mailbox://' /tmp/briar.log | tail -n 1 || true)"
+MAILBOX_URL="$(grep -E '^briar-mailbox://' "$LOG" | tail -n 1 || true)"
 
 if [[ -z "${MAILBOX_URL}" ]]; then
   echo "Could not find briar-mailbox URL in logs."
   echo "Last 200 lines:"
-  tail -n 200 /tmp/briar.log || true
+  tail -n 200 "$LOG" || true
 else
   echo "${MAILBOX_URL}" > "${QR_TXT}"
   echo "Mailbox URL captured: ${MAILBOX_URL}"
-fi
 
-# Generate QR PNG (works regardless of dark mode)
-if [[ -n "${MAILBOX_URL}" ]]; then
-  python3 - <<'PY'
+  # Generate QR PNG using the venv python (has qrcode + pillow)
+  python - <<'PY'
 import qrcode, pathlib
 txt = pathlib.Path("/data/mailbox.txt").read_text().strip()
 img = qrcode.make(txt)
@@ -43,8 +42,8 @@ img.save("/data/qr.png")
 PY
 fi
 
-# Create a tiny HTML page to show it
-cat > /tmp/index.html <<'HTML'
+# Create a tiny HTML page in /data so the same server can serve everything
+cat > "$INDEX" <<'HTML'
 <!doctype html>
 <html>
 <head>
@@ -54,7 +53,7 @@ cat > /tmp/index.html <<'HTML'
   <style>
     body { font-family: sans-serif; padding: 16px; }
     .wrap { max-width: 520px; margin: 0 auto; }
-    img { width: 100%; height: auto; image-rendering: crisp-edges; }
+    img { width: 100%; height: auto; image-rendering: crisp-edges; background: #fff; padding: 12px; border-radius: 12px; }
     code { word-break: break-all; display:block; padding: 12px; border: 1px solid #ccc; border-radius: 8px; }
   </style>
 </head>
@@ -64,10 +63,12 @@ cat > /tmp/index.html <<'HTML'
     <p>Scan this QR in Briar Desktop or copy the link below.</p>
     <p><img src="/qr.png" alt="QR"/></p>
     <h3>Copy/paste link</h3>
-    <code id="link"></code>
+    <code id="link">Loading…</code>
     <script>
       fetch('/mailbox.txt').then(r => r.text()).then(t => {
-        document.getElementById('link').textContent = t.trim();
+        document.getElementById('link').textContent = t.trim() || '(no link found yet)';
+      }).catch(() => {
+        document.getElementById('link').textContent = '(could not load mailbox.txt)';
       });
     </script>
   </div>
@@ -75,10 +76,9 @@ cat > /tmp/index.html <<'HTML'
 </html>
 HTML
 
-# Serve /data + index.html on 8080 for HA Ingress
-# Use Python's builtin server and route / to index.html
-cd /tmp
-python3 -m http.server 8080 --bind 0.0.0.0 >/dev/null 2>&1 &
+# Serve /data on 8080 for HA Ingress
+cd "$DATA_DIR"
+python -m http.server 8080 --bind 0.0.0.0 >/dev/null 2>&1 &
 WebPID=$!
 
 # Keep container alive as long as Briar is alive

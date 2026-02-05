@@ -17,25 +17,24 @@ RUN git clone --depth=1 https://code.briarproject.org/briar/briar-mailbox.git . 
   && cp mailbox-cli/build/libs/mailbox-cli-linux-x86_64.jar /out/briar-mailbox.jar
 
 # -------------------------
-# Runtime: HA base + JRE copied from builder
+# Runtime: HA base + Java17 (copied) + Python venv
 # -------------------------
 FROM ${BUILD_FROM}
 
-# Install necessary tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash ca-certificates \
-    openjdk-21-jre-headless \
-    python3 python3-pip \
-  && pip3 install --no-cache-dir qrcode[pil] pillow \
+    python3 python3-venv \
+  && python3 -m venv /opt/venv \
+  && /opt/venv/bin/pip install --no-cache-dir "qrcode[pil]" pillow \
   && update-ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-
-# Copy a known-good Java 17 runtime from the builder
+# Copy Java 17 runtime from builder
 COPY --from=builder /opt/java/openjdk /opt/java/openjdk
 ENV JAVA_HOME=/opt/java/openjdk
-ENV PATH="/opt/java/openjdk/bin:${PATH}"
+ENV PATH="/opt/java/openjdk/bin:/opt/venv/bin:${PATH}"
 
+# Copy app + entrypoint
 COPY --from=builder /out/briar-mailbox.jar /app/briar-mailbox.jar
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh

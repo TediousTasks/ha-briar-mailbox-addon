@@ -4,13 +4,14 @@ set -euo pipefail
 DATA_DIR="/data"
 LOG="/tmp/briar.log"
 INDEX="${DATA_DIR}/index.html"
-QR_TXT="${DATA_DIR}/mailbox.txt"
-QR_PNG="${DATA_DIR}/qr.png"
-QR_ASCII="${DATA_DIR}/qr_ascii.txt"
+ASCII_TXT="${DATA_DIR}/ascii.txt"
+URL_TXT="${DATA_DIR}/mailbox.txt"
 HTTP_LOG="/tmp/http.log"
 
 mkdir -p "$DATA_DIR"
 : > "$LOG"
+: > "$ASCII_TXT"
+: > "$URL_TXT"
 
 # Force Briar to use /data (not /root)
 export HOME=/data
@@ -19,31 +20,68 @@ export XDG_CONFIG_HOME=/data/.config
 export XDG_CACHE_HOME=/data/.cache
 mkdir -p /data/.local/share /data/.config /data/.cache
 
-# Create placeholder files so Ingress never 404s
-: > "$QR_TXT"
-: > "$QR_ASCII"
-
-python - <<'PY'
-from PIL import Image
-Image.new("RGB", (600, 600), "white").save("/data/qr.png")
-PY
-
-# HTML (RELATIVE PATHS ONLY — critical for HA ingress)
+# ---- Web UI (served from /data) ----
 cat > "$INDEX" <<'HTML'
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Briar Mailbox QR</title>
+  <title>Briar Mailbox</title>
   <style>
-    body { font-family: sans-serif; padding: 16px; }
-    .wrap { max-width: 760px; margin: 0 auto; }
-    .muted { color: #666; }
-    .qrframe { background:#fff; padding:16px; border:1px solid #ddd; border-radius:12px; display:inline-block; }
-    #qrimg { display:block; width:520px; max-width:100%; height:auto; image-rendering: pixelated; image-rendering: crisp-edges; }
-    code { word-break: break-all; display:block; padding:12px; border:1px solid #ccc; border-radius:8px; background:#f7f7f7; }
-    pre { white-space: pre; overflow-x: auto; background:#f7f7f7; border:1px solid #ddd; border-radius:8px; padding:12px; }
+    :root {
+      --bg: #ffffff;
+      --fg: #111111;
+      --muted: #666666;
+      --card: #f7f7f7;
+      --border: #dddddd;
+      --codebg: #f3f3f3;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f1115;
+        --fg: #e7e7e7;
+        --muted: #a7a7a7;
+        --card: #171a21;
+        --border: #2a2f3a;
+        --codebg: #141821;
+      }
+    }
+
+    body { font-family: system-ui, sans-serif; margin: 0; background: var(--bg); color: var(--fg); }
+    .wrap { max-width: 840px; margin: 0 auto; padding: 16px; }
+    .muted { color: var(--muted); }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+    pre {
+      margin: 0;
+      padding: 12px;
+      background: var(--codebg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow-x: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      line-height: 1.05;
+      font-size: 12px;
+      white-space: pre;
+    }
+    code {
+      display:block;
+      padding: 12px;
+      background: var(--codebg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      word-break: break-all;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    .row { display: grid; gap: 12px; }
+    button {
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--fg);
+      padding: 8px 10px;
+      border-radius: 10px;
+      cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -51,51 +89,72 @@ cat > "$INDEX" <<'HTML'
     <h2>Briar Mailbox</h2>
     <p class="muted">This page refreshes every 2 seconds.</p>
 
-    <h3>QR (exactly from Briar log)</h3>
-    <div class="qrframe">
-      <img id="qrimg" src="qr.png" alt="QR">
+    <div class="row">
+      <div class="card">
+        <h3 style="margin:0 0 8px 0;">ASCII QR (from Briar log)</h3>
+        <pre id="ascii">(waiting for ASCII QR...)</pre>
+      </div>
+
+      <div class="card">
+        <h3 style="margin:0 0 8px 0;">Desktop link</h3>
+        <code id="link">(waiting for briar-mailbox:// link...)</code>
+        <div style="display:flex; gap:8px; margin-top:10px;">
+          <button id="copy" type="button">Copy link</button>
+          <span class="muted" id="copystatus"></span>
+        </div>
+      </div>
     </div>
-
-    <h3>Desktop link</h3>
-    <code id="link">(waiting...)</code>
-
-    <h3>Captured ASCII (debug)</h3>
-    <pre id="ascii">(waiting...)</pre>
-
-    <script>
-      async function refresh() {
-        try {
-          const t = (await (await fetch('mailbox.txt', { cache: 'no-store' })).text()).trim();
-          document.getElementById('link').textContent = t || '(waiting...)';
-        } catch (e) {
-          document.getElementById('link').textContent = '(error loading mailbox.txt)';
-        }
-
-        try {
-          const a = await (await fetch('qr_ascii.txt', { cache: 'no-store' })).text();
-          document.getElementById('ascii').textContent = a.trim() ? a : '(waiting...)';
-        } catch (e) {
-          document.getElementById('ascii').textContent = '(error loading qr_ascii.txt)';
-        }
-
-        document.getElementById('qrimg').src = 'qr.png?t=' + Date.now();
-      }
-      refresh();
-      setInterval(refresh, 2000);
-    </script>
   </div>
+
+  <script>
+    async function refresh() {
+      try {
+        const ascii = await (await fetch('/ascii.txt', { cache: 'no-store' })).text();
+        document.getElementById('ascii').textContent =
+          ascii.trim() ? ascii.replace(/\r/g,'') : '(waiting for ASCII QR...)';
+      } catch {
+        document.getElementById('ascii').textContent = '(could not load ascii.txt)';
+      }
+
+      try {
+        const link = (await (await fetch('/mailbox.txt', { cache: 'no-store' })).text()).trim();
+        document.getElementById('link').textContent = link || '(waiting for briar-mailbox:// link...)';
+      } catch {
+        document.getElementById('link').textContent = '(could not load mailbox.txt)';
+      }
+    }
+
+    document.getElementById('copy').addEventListener('click', async () => {
+      const link = document.getElementById('link').textContent.trim();
+      const status = document.getElementById('copystatus');
+      if (!link || link.startsWith('(waiting') || link.startsWith('(could not')) {
+        status.textContent = 'No link yet';
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(link);
+        status.textContent = 'Copied';
+        setTimeout(() => status.textContent = '', 1200);
+      } catch {
+        status.textContent = 'Copy failed';
+      }
+    });
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
 </body>
 </html>
 HTML
 
-# Serve /data on 8080 (Ingress-safe)
+# Serve /data on 8080 and map "/" -> "/index.html"
 cat > /tmp/server.py <<'PY'
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 import os
 
 class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/" or self.path.startswith("/?"):
+        if self.path == "/":
             self.path = "/index.html"
         return super().do_GET()
 
@@ -103,111 +162,57 @@ os.chdir("/data")
 HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
 PY
 
-python /tmp/server.py >"$HTTP_LOG" 2>&1 &
-echo "HTTP server started on :8080. Logs: $HTTP_LOG"
+python3 /tmp/server.py >"$HTTP_LOG" 2>&1 &
+WebPID=$!
+echo "Ingress web server started (pid=$WebPID). Logs: $HTTP_LOG"
 
-# Start Briar mailbox (log captured)
+# ---- Start Briar ----
 echo "Starting Briar mailbox..."
-java -jar /app/briar-mailbox.jar 2>&1 | tee -a "$LOG" &
+java -jar /app/briar-mailbox.jar > >(tee -a "$LOG") 2>&1 &
 BriarPID=$!
 
-extract_ascii_qr() {
-  # Use "inside" not "in" (reserved on some awk)
+echo "Waiting for Briar ASCII QR + mailbox URL..."
+
+# Wait up to 180s for both ASCII block and URL to show up
+for i in $(seq 1 180); do
+  # If Briar died, stop
+  if ! kill -0 "$BriarPID" 2>/dev/null; then
+    echo "Briar exited before capture completed."
+    break
+  fi
+
+  # Capture ASCII QR block (exactly what's printed after the prompt line)
+  # Start: "Please scan this with the Briar Android app:"
+  # End:   "Or copy and paste this into Briar Desktop:"
   awk '
     BEGIN {inside=0}
     /Please scan this with the Briar Android app:/ {inside=1; next}
     /Or copy and paste this into Briar Desktop:/ {inside=0}
     inside==1 {print}
-  ' "$LOG" > "$QR_ASCII" || true
+  ' "$LOG" > "$ASCII_TXT" || true
 
-  # Trim only leading/trailing blank lines (don’t touch internal spacing)
-  python - <<'PY'
-from pathlib import Path
-p = Path("/data/qr_ascii.txt")
-lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
-# strip leading/trailing empties
-while lines and not lines[0].strip():
-    lines.pop(0)
-while lines and not lines[-1].strip():
-    lines.pop()
-p.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-PY
-}
-
-render_ascii_qr_to_png() {
-  python - <<'PY'
-from pathlib import Path
-from PIL import Image
-
-rows = Path("/data/qr_ascii.txt").read_text(encoding="utf-8", errors="ignore").splitlines()
-rows = [r.rstrip("\n") for r in rows if r.strip()]
-
-if not rows:
-    Image.new("RGB", (600, 600), "white").save("/data/qr.png")
-    raise SystemExit(0)
-
-w = max(len(r) for r in rows)
-rows = [r.ljust(w, " ") for r in rows]
-h = len(rows)
-
-scale = 12      # make it big enough to scan even via ingress
-border = 5      # quiet zone
-
-img_w = (w + border*2) * scale
-img_h = (h + border*2) * scale
-
-img = Image.new("RGB", (img_w, img_h), "white")
-px = img.load()
-
-def is_black(ch: str) -> bool:
-    # Briar prints █, but treat any non-space as black to be robust
-    return ch != " "
-
-for y, row in enumerate(rows):
-    for x, ch in enumerate(row):
-        if is_black(ch):
-            x0 = (x + border) * scale
-            y0 = (y + border) * scale
-            for yy in range(y0, y0 + scale):
-                for xx in range(x0, x0 + scale):
-                    px[xx, yy] = (0, 0, 0)
-
-img.save("/data/qr.png")
-PY
-}
-
-echo "Waiting for Briar ASCII QR + mailbox URL..."
-
-MAILBOX_URL=""
-FOUND_QR=""
-
-for i in $(seq 1 240); do
-  if ! kill -0 "$BriarPID" 2>/dev/null; then
-    echo "Briar exited before QR/URL was fully captured."
-    break
+  # Capture the briar-mailbox:// URL (works even if indented)
+  URL="$(grep -Eo 'briar-mailbox://[^[:space:]]+' "$LOG" | tail -n 1 || true)"
+  if [[ -n "${URL:-}" ]]; then
+    echo "$URL" > "$URL_TXT"
   fi
 
-  # Desktop URL (not used for Android QR, but still useful to display)
-  MAILBOX_URL="$(grep -Eo 'briar-mailbox://[^[:space:]]+' "$LOG" | tail -n 1 || true)"
-  if [[ -n "$MAILBOX_URL" ]]; then
-    echo "$MAILBOX_URL" > "$QR_TXT"
-  fi
-
-  extract_ascii_qr
-
-  # If we have a real-looking QR block, render it
-  if [[ "$(wc -l < "$QR_ASCII" | tr -d ' ')" -ge 20 ]]; then
-    render_ascii_qr_to_png
-    FOUND_QR="yes"
-  fi
-
-  if [[ -n "$MAILBOX_URL" && -n "$FOUND_QR" ]]; then
-    echo "Captured URL + rendered ASCII QR."
+  # If we have both, we’re done
+  if [[ -s "$ASCII_TXT" && -s "$URL_TXT" ]]; then
+    echo "Captured ASCII QR and mailbox URL."
     break
   fi
 
   sleep 1
 done
 
-echo "Mailbox URL captured: $(cat "$QR_TXT" 2>/dev/null || true)"
+if [[ ! -s "$ASCII_TXT" ]]; then
+  echo "WARNING: ASCII QR block not captured yet."
+fi
+
+if [[ ! -s "$URL_TXT" ]]; then
+  echo "WARNING: mailbox URL not captured yet."
+fi
+
+# Keep container alive as long as Briar is alive
 wait "$BriarPID"

@@ -1,7 +1,6 @@
 #!/usr/bin/with-contenv bash
 set -e
 
-# Force all “user home” and XDG dirs into /data (persistent + writable in HA add-on)
 export HOME="/data"
 export XDG_DATA_HOME="/data/xdg/data"
 export XDG_CONFIG_HOME="/data/xdg/config"

@@ -1,6 +1,6 @@
 name: "Briar Mailbox"
 slug: "briar_mailbox"
-version: "0.1.5"
+version: "0.1.7"
 description: "Briar Mailbox Server CLI packaged as a Home Assistant add-on."
 url: "https://code.briarproject.org/briar/briar-mailbox"
 
@@ -15,5 +15,4 @@ ingress_port: 8080
 ingress_entry: /
 panel_icon: mdi:qrcode
 
-# Do NOT expose ports externally
 ports: {}

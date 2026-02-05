@@ -1,5 +1,6 @@
-# Home Assistant passes BUILD_FROM at build time, but we give a safe default
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:latest
+# Home Assistant provides BUILD_FROM automatically.
+# Safe default so it never becomes blank.
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:latest
 
 # -------------------------
 # Build stage (compile JAR)
@@ -12,27 +13,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Clone and build
 RUN git clone --depth=1 https://code.briarproject.org/briar/briar-mailbox.git . \
   && ./gradlew --no-daemon x86LinuxJar \
-  && ls -la mailbox-cli/build/libs/
-
-# Put the jar somewhere predictable
-RUN cp mailbox-cli/build/libs/mailbox-cli-linux-x86_64.jar /out/briar-mailbox.jar
-
+  && cp mailbox-cli/build/libs/mailbox-cli-linux-x86_64.jar /out/briar-mailbox.jar
 
 # -------------------------
-# Runtime stage (HA base)
+# Runtime stage (HA Debian)
 # -------------------------
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:latest
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:latest
 FROM ${BUILD_FROM}
 
-# HA base is Alpine, so use apk
-RUN apk add --no-cache \
-    bash \
-    openjdk17-jre \
-    ca-certificates \
-  && update-ca-certificates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash ca-certificates \
+    openjdk-17-jre-headless \
+  && update-ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/briar-mailbox.jar /app/briar-mailbox.jar
 COPY run.sh /run.sh

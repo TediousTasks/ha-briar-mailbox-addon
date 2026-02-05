@@ -1,5 +1,5 @@
 #!/usr/bin/with-contenv bash
-set -euo pipefail
+set -Eeuo pipefail
 
 DATA_DIR="/data"
 LOG="/tmp/briar.log"
@@ -14,6 +14,17 @@ RESET_FLAG="${DATA_DIR}/reset"
 
 mkdir -p "$DATA_DIR"
 
+log() { echo "[$(date -Is)] $*" >&2; }
+
+# If anything errors, we log the line and keep the addon alive
+on_err() {
+  local rc=$?
+  log "FATAL: error on/near line ${BASH_LINENO[0]} (rc=$rc). Keeping container alive for logs."
+  echo "ERROR" > "$STATUS_TXT" 2>/dev/null || true
+  while true; do sleep 3600; done
+}
+trap on_err ERR
+
 # Force Briar to use /data (not /root)
 export HOME=/data
 export XDG_DATA_HOME=/data/.local/share
@@ -21,12 +32,11 @@ export XDG_CONFIG_HOME=/data/.config
 export XDG_CACHE_HOME=/data/.cache
 mkdir -p /data/.local/share /data/.config /data/.cache
 
+# Init files
 : > "$LOG"
 : > "$QR_ASCII"
 : > "$QR_TXT"
 echo "STARTING" > "$STATUS_TXT"
-
-log() { echo "[$(date -Is)] $*" >&2; }
 
 consume_reset_request() {
   [[ -f "$RESET_FLAG" ]] || return 1
@@ -55,15 +65,12 @@ kill_orphan_tor() {
     " tor "
   )
 
-  local killed="no"
   for pat in "${patterns[@]}"; do
     local pids
     pids="$(pgrep -f "$pat" 2>/dev/null || true)"
-    if [[ -n "$pids" ]]; then
-      killed="yes"
-      log "Cleanup: TERM '$pat' pids: $pids"
-      kill $pids 2>/dev/null || true
-    fi
+    [[ -n "$pids" ]] || continue
+    log "Cleanup: TERM '$pat' pids: $pids"
+    kill $pids 2>/dev/null || true
   done
 
   sleep 1
@@ -71,13 +78,12 @@ kill_orphan_tor() {
   for pat in "${patterns[@]}"; do
     local pids
     pids="$(pgrep -f "$pat" 2>/dev/null || true)"
-    if [[ -n "$pids" ]]; then
-      log "Cleanup: KILL '$pat' pids: $pids"
-      kill -9 $pids 2>/dev/null || true
-    fi
+    [[ -n "$pids" ]] || continue
+    log "Cleanup: KILL '$pat' pids: $pids"
+    kill -9 $pids 2>/dev/null || true
   done
 
-  [[ "$killed" == "yes" ]] && sleep 1
+  sleep 1
 }
 
 stop_briar_hard() {
@@ -145,9 +151,7 @@ PY
 update_pairing_url() {
   local url
   url="$(grep -Eo 'briar-mailbox://[^[:space:]]+' "$LOG" | tail -n 1 || true)"
-  if [[ -n "$url" ]]; then
-    echo "$url" > "$QR_TXT"
-  fi
+  [[ -n "$url" ]] && echo "$url" > "$QR_TXT"
 }
 
 saw_pairing_prompt() {
@@ -161,7 +165,6 @@ tor_bootstrapped() {
 }
 
 tor_progress_pct() {
-  # IMPORTANT: must never fail under `set -euo pipefail`
   local pct=""
   pct="$(
     grep -Eo 'Bootstrapped [0-9]{1,3}% ' "$LOG" 2>/dev/null \
@@ -169,14 +172,10 @@ tor_progress_pct() {
       | grep -Eo '[0-9]{1,3}' \
       || true
   )"
-  if [[ -z "$pct" ]]; then
-    echo 0
-  else
-    echo "$pct"
-  fi
+  [[ -z "$pct" ]] && echo 0 || echo "$pct"
 }
 
-# --- Clean UI page ---
+# --- Clean UI page (connected vs pairing) ---
 cat > "$INDEX" <<'HTML'
 <!doctype html>
 <html>
@@ -203,7 +202,7 @@ cat > "$INDEX" <<'HTML'
 <body>
   <div class="wrap">
     <h2>Briar Mailbox</h2>
-    <p class="muted">If pairing is shown, click Refresh after a few seconds to update.</p>
+    <p class="muted">Click Refresh to update the pairing view.</p>
 
     <div class="card">
       <div class="row">
@@ -214,23 +213,21 @@ cat > "$INDEX" <<'HTML'
 
       <div id="connectedBlock" style="display:none; margin-top:14px;">
         <h3>Connected</h3>
-        <p class="muted">This mailbox appears to already be configured and running.</p>
+        <p class="muted">Mailbox appears to already be configured and running.</p>
       </div>
 
       <div id="pairBlock" style="display:none; margin-top:14px;">
         <h3>Pairing</h3>
-        <p class="muted">Scan the ASCII QR in the Briar Android app, or copy the desktop link.</p>
-
+        <p class="muted">Scan the ASCII QR in Briar Android, or copy the desktop link.</p>
         <h4>ASCII QR</h4>
         <pre id="ascii">(waiting...)</pre>
-
         <h4>Desktop link</h4>
         <code id="link">(waiting...)</code>
       </div>
 
       <div id="startingBlock" style="display:none; margin-top:14px;">
         <h3>Starting</h3>
-        <p class="muted">Briar is starting up. Refresh in a few seconds.</p>
+        <p class="muted">Briar is starting. Refresh in a few seconds.</p>
       </div>
 
       <div id="errorBlock" style="display:none; margin-top:14px;">
@@ -340,6 +337,7 @@ PY
 
 python /tmp/server.py >"$HTTP_LOG" 2>&1 &
 log "HTTP server started on :8080. Logs: $HTTP_LOG"
+log "Continuing to start Briar (if you do not see this line, your file is not what is running)."
 
 BriarPID=""
 

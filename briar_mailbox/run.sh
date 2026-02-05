@@ -1,5 +1,5 @@
 #!/usr/bin/with-contenv bash
-set -euo pipefail
+set -u
 
 DATA_DIR="/data"
 LOG="/tmp/briar.log"
@@ -7,8 +7,8 @@ INDEX="${DATA_DIR}/index.html"
 QR_TXT="${DATA_DIR}/mailbox.txt"
 QR_ASCII="${DATA_DIR}/qr_ascii.txt"
 STATUS_TXT="${DATA_DIR}/status.txt"
-CONNECTED_FLAG="${DATA_DIR}/connected"   # persists across restarts
-RESET_FLAG="${DATA_DIR}/reset"           # set by web UI POST /reset
+CONNECTED_FLAG="${DATA_DIR}/connected"
+RESET_FLAG="${DATA_DIR}/reset"
 HTTP_LOG="/tmp/http.log"
 
 mkdir -p "$DATA_DIR"
@@ -21,10 +21,12 @@ export XDG_CONFIG_HOME=/data/.config
 export XDG_CACHE_HOME=/data/.cache
 mkdir -p /data/.local/share /data/.config /data/.cache
 
-# Placeholders so ingress never 404s
+# Placeholders so Ingress never 404s
 : > "$QR_TXT"
 : > "$QR_ASCII"
 echo "STARTING" > "$STATUS_TXT"
+
+log() { echo "[$(date -Is)] $*"; }
 
 mark_connected() {
   date -Is > "$CONNECTED_FLAG"
@@ -40,11 +42,9 @@ mark_pairing() {
 }
 
 do_reset_now() {
-  echo "RESET requested — wiping Briar state to force re-pairing..."
-
+  log "RESET requested — wiping Briar state to force re-pairing..."
   echo "RESETTING" > "$STATUS_TXT"
 
-  # Stop exposing old pairing artifacts/status
   rm -f "$CONNECTED_FLAG" 2>/dev/null || true
   : > "$QR_TXT"
   : > "$QR_ASCII"
@@ -52,14 +52,53 @@ do_reset_now() {
   # Wipe Briar state (because HOME/XDG_* point to /data)
   rm -rf /data/.local/share/* /data/.config/* /data/.cache/* 2>/dev/null || true
 
-  # Clear the reset flag (one-shot)
   rm -f "$RESET_FLAG" 2>/dev/null || true
-
   : > "$LOG"
-  echo "RESET complete."
+  log "RESET complete."
 }
 
-# HTML (relative paths only — HA ingress)
+extract_ascii_qr() {
+  awk '
+    BEGIN {inside=0}
+    /Please scan this with the Briar Android app:/ {inside=1; next}
+    /Or copy and paste this into Briar Desktop:/ {inside=0}
+    inside==1 {print}
+  ' "$LOG" > "$QR_ASCII" 2>/dev/null || true
+
+  python - <<'PY'
+from pathlib import Path
+p = Path("/data/qr_ascii.txt")
+try:
+    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+except FileNotFoundError:
+    lines = []
+while lines and not lines[0].strip():
+    lines.pop(0)
+while lines and not lines[-1].strip():
+    lines.pop()
+p.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+PY
+}
+
+update_pairing_url() {
+  local url=""
+  url="$(grep -Eo 'briar-mailbox://[^[:space:]]+' "$LOG" 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$url" ]]; then
+    echo "$url" > "$QR_TXT"
+  fi
+}
+
+saw_pairing_prompt() {
+  grep -q "Please scan this with the Briar Android app:" "$LOG" 2>/dev/null \
+  || grep -q "Or copy and paste this into Briar Desktop:" "$LOG" 2>/dev/null \
+  || grep -Eqo 'briar-mailbox://[^[:space:]]+' "$LOG" 2>/dev/null
+}
+
+tor_bootstrapped() {
+  grep -q "Bootstrapped 100% (done): Done" "$LOG" 2>/dev/null
+}
+
+# HTML (relative paths only — HA ingress) with Reset button
 cat > "$INDEX" <<'HTML'
 <!doctype html>
 <html>
@@ -96,12 +135,12 @@ cat > "$INDEX" <<'HTML'
 
       <div id="connectedBlock" style="display:none; margin-top:12px;">
         <h3>Connected</h3>
-        <p class="muted">This mailbox appears to already be configured. Pairing details are hidden.</p>
+        <p class="muted">Mailbox is configured. Pairing details are hidden.</p>
       </div>
 
       <div id="pairBlock" style="display:none; margin-top:12px;">
         <h3>Pairing</h3>
-        <p class="muted">Scan the ASCII QR in the Briar Android app, or copy the desktop link.</p>
+        <p class="muted">Scan the ASCII QR in Briar Android, or copy the desktop link.</p>
 
         <h4>ASCII QR</h4>
         <pre id="ascii">(waiting...)</pre>
@@ -154,13 +193,10 @@ cat > "$INDEX" <<'HTML'
       }
 
       document.getElementById("resetBtn").addEventListener("click", async () => {
-        if (!confirm("Reset mailbox now? This will unlink all clients and require pairing again.")) return;
-
+        if (!confirm("Reset mailbox now? This will require pairing again.")) return;
         try {
           const r = await fetch("reset", { method: "POST", cache: "no-store" });
           if (!r.ok) throw new Error("HTTP " + r.status);
-          // Give the add-on a moment to restart Briar and update status.
-          await new Promise(res => setTimeout(res, 1500));
           location.reload();
         } catch (e) {
           alert("Reset failed: " + e);
@@ -174,7 +210,7 @@ cat > "$INDEX" <<'HTML'
 </html>
 HTML
 
-# Serve /data on 8080 (Ingress-safe) + reset endpoint
+# Serve /data on 8080 + reset endpoint (touch /data/reset)
 cat > /tmp/server.py <<'PY'
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 import os
@@ -190,21 +226,17 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         if self.path.rstrip("/") == "/reset":
-            # Create a flag file; run.sh will detect and perform reset.
             try:
                 with open(RESET_FLAG, "w", encoding="utf-8") as f:
                     f.write("reset\n")
                 self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.end_headers()
                 self.wfile.write(b"OK\n")
             except Exception as e:
                 self.send_response(500)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.end_headers()
                 self.wfile.write(("ERROR: %s\n" % e).encode("utf-8"))
             return
-
         self.send_response(404)
         self.end_headers()
 
@@ -213,56 +245,18 @@ HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
 PY
 
 python /tmp/server.py >"$HTTP_LOG" 2>&1 &
-echo "HTTP server started on :8080. Logs: $HTTP_LOG"
-
-extract_ascii_qr() {
-  awk '
-    BEGIN {inside=0}
-    /Please scan this with the Briar Android app:/ {inside=1; next}
-    /Or copy and paste this into Briar Desktop:/ {inside=0}
-    inside==1 {print}
-  ' "$LOG" > "$QR_ASCII" || true
-
-  python - <<'PY'
-from pathlib import Path
-p = Path("/data/qr_ascii.txt")
-lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
-while lines and not lines[0].strip():
-    lines.pop(0)
-while lines and not lines[-1].strip():
-    lines.pop()
-p.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-PY
-}
-
-update_pairing_url() {
-  local url
-  url="$(grep -Eo 'briar-mailbox://[^[:space:]]+' "$LOG" | tail -n 1 || true)"
-  if [[ -n "$url" ]]; then
-    echo "$url" > "$QR_TXT"
-  fi
-}
-
-saw_pairing_prompt() {
-  grep -q "Please scan this with the Briar Android app:" "$LOG" \
-  || grep -q "Or copy and paste this into Briar Desktop:" "$LOG" \
-  || grep -Eqo 'briar-mailbox://[^[:space:]]+' "$LOG"
-}
-
-tor_bootstrapped() {
-  grep -q "Bootstrapped 100% (done): Done" "$LOG"
-}
+log "HTTP server started on :8080. Logs: $HTTP_LOG"
 
 start_briar() {
   : > "$LOG"
-  echo "Starting Briar mailbox..."
+  log "Starting Briar mailbox..."
   java -jar /app/briar-mailbox.jar 2>&1 | tee -a "$LOG" &
   echo $!
 }
 
-# Main loop: keep Briar running; allow reset via /reset button at any time.
+# Supervisor loop: keep Briar running; allow resets at any time.
 while true; do
-  # Default UI state based on persisted flag
+  # If we previously marked CONNECTED, show it immediately (but still watch logs)
   if [[ -f "$CONNECTED_FLAG" ]]; then
     echo "CONNECTED (flag)" > "$STATUS_TXT"
   else
@@ -271,14 +265,14 @@ while true; do
 
   BriarPID="$(start_briar)"
 
-  # Decide state from logs (up to ~60 seconds)
-  for i in $(seq 1 60); do
-    # Reset requested?
+  # Early-state detection window (up to 60s)
+  for _ in $(seq 1 60); do
     if [[ -f "$RESET_FLAG" ]]; then
+      log "Reset flag detected during startup window."
       kill "$BriarPID" 2>/dev/null || true
       wait "$BriarPID" 2>/dev/null || true
       do_reset_now
-      # restart loop (fresh instance)
+      # restart outer loop
       continue 2
     fi
 
@@ -302,34 +296,31 @@ while true; do
     sleep 1
   done
 
-  # If pairing, keep updating until connected OR reset OR Briar exits
-  if grep -q "^PAIRING" "$STATUS_TXT"; then
-    stable_connected_count=0
-    while true; do
+  # Pairing mode loop: keep updating artifacts until we flip to CONNECTED or reset
+  if grep -q "^PAIRING" "$STATUS_TXT" 2>/dev/null; then
+    stable_connected=0
+    while kill -0 "$BriarPID" 2>/dev/null; do
       if [[ -f "$RESET_FLAG" ]]; then
+        log "Reset flag detected during pairing."
         kill "$BriarPID" 2>/dev/null || true
         wait "$BriarPID" 2>/dev/null || true
         do_reset_now
         continue 2
       fi
 
-      if ! kill -0 "$BriarPID" 2>/dev/null; then
-        echo "ERROR: Briar exited" > "$STATUS_TXT"
-        break
-      fi
-
       update_pairing_url
       extract_ascii_qr
 
+      # Flip to CONNECTED when pairing prompt disappears and Tor is up for ~10s
       if ! saw_pairing_prompt && tor_bootstrapped; then
-        stable_connected_count=$((stable_connected_count + 1))
+        stable_connected=$((stable_connected + 1))
       else
-        stable_connected_count=0
+        stable_connected=0
       fi
 
-      if [[ "$stable_connected_count" -ge 10 ]]; then
+      if [[ "$stable_connected" -ge 10 ]]; then
         mark_connected
-        echo "Detected connected state. Pairing details cleared."
+        log "Detected connected state. Pairing details cleared."
         break
       fi
 
@@ -337,18 +328,24 @@ while true; do
     done
   fi
 
-  # If connected, just keep running; still allow reset button.
-  while kill -0 "$BriarPID" 2>/dev/null; do
+  # Connected/steady-state: just keep Briar alive, allow reset
+  while true; do
     if [[ -f "$RESET_FLAG" ]]; then
+      log "Reset flag detected during steady-state."
       kill "$BriarPID" 2>/dev/null || true
       wait "$BriarPID" 2>/dev/null || true
       do_reset_now
-      continue 2
+      break
     fi
+
+    if ! kill -0 "$BriarPID" 2>/dev/null; then
+      log "Briar exited unexpectedly; restarting..."
+      echo "ERROR: Briar exited" > "$STATUS_TXT"
+      break
+    fi
+
     sleep 1
   done
 
-  # Briar exited unexpectedly; loop will restart it.
-  echo "Briar exited; restarting..."
   sleep 2
 done

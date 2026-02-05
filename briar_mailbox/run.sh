@@ -247,7 +247,9 @@ cat > "$INDEX" <<'HTML'
       <div class="row">
         <div id="stateTag" class="tag warn">Loading…</div>
         <a class="btn" href="./">Refresh</a>
-        <a class="btn btn-danger" href="reset" id="resetLink">Reset</a>
+        <form method="post" action="reset" style="display:inline;">
+          <button class="btn btn-danger" type="submit" id="resetBtn">Reset</button>
+        </form>
       </div>
 
       <div id="connectedBlock" style="display:none; margin-top:14px;">
@@ -276,7 +278,7 @@ cat > "$INDEX" <<'HTML'
     </div>
 
     <script>
-      document.getElementById("resetLink").addEventListener("click", (e) => {
+      document.getElementById("resetBtn").addEventListener("click", (e) => {
         if (!confirm("Reset now? This wipes /data and requires pairing again.")) e.preventDefault();
       });
 
@@ -358,32 +360,79 @@ HTML
 cat > /tmp/server.py <<'PY'
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 import os, time
+import ipaddress
 
 DATA_DIR = "/data"
 RESET_FLAG = os.path.join(DATA_DIR, "reset")
 
+# Home Assistant Supervisor ingress network
+INGRESS_NET = ipaddress.ip_network("172.30.32.0/23")
+LOOPBACK = ipaddress.ip_address("127.0.0.1")
+
+def ingress_allowed(client_ip: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    return ip == LOOPBACK or ip in INGRESS_NET
+
 class Handler(SimpleHTTPRequestHandler):
+    def _deny_if_not_ingress(self) -> bool:
+        ip = self.client_address[0]
+        if not ingress_allowed(ip):
+            self.send_response(403)
+            self.end_headers()
+            return True
+        return False
+
     def do_GET(self):
+        if self._deny_if_not_ingress():
+            return
+
         if self.path == "/" or self.path.startswith("/?"):
             self.path = "/index.html"
             return super().do_GET()
 
+        # Reset is POST-only now
         if self.path.rstrip("/") == "/reset":
-            try:
-                with open(RESET_FLAG, "w", encoding="utf-8") as f:
-                    f.write(str(int(time.time())) + "\n")
-            except Exception:
-                pass
-            self.send_response(302)
-            self.send_header("Location", "./")
+            self.send_response(405)  # Method Not Allowed
+            self.send_header("Allow", "POST")
             self.end_headers()
             return
 
         return super().do_GET()
 
+    def do_POST(self):
+        if self._deny_if_not_ingress():
+            return
+
+        if self.path.rstrip("/") == "/reset":
+            # Drain body (optional but tidy)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > 0:
+                    _ = self.rfile.read(length)
+            except Exception:
+                pass
+
+            try:
+                with open(RESET_FLAG, "w", encoding="utf-8") as f:
+                    f.write(str(int(time.time())) + "\n")
+            except Exception:
+                pass
+
+            self.send_response(303)  # redirect after POST
+            self.send_header("Location", "./")
+            self.end_headers()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
 os.chdir(DATA_DIR)
 HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
 PY
+
 
 python /tmp/server.py >"$HTTP_LOG" 2>&1 &
 log "HTTP server started on :8080. Logs: $HTTP_LOG"

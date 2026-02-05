@@ -1,5 +1,5 @@
 #!/usr/bin/with-contenv bash
-set -uo pipefail
+set -euo pipefail
 
 DATA_DIR="/data"
 LOG="/tmp/briar.log"
@@ -10,6 +10,7 @@ QR_TXT="${DATA_DIR}/mailbox.txt"
 QR_ASCII="${DATA_DIR}/qr_ascii.txt"
 STATUS_TXT="${DATA_DIR}/status.txt"
 BRIAR_TAIL="${DATA_DIR}/briar_tail.txt"
+CONTROL_LOG="${DATA_DIR}/control.log"
 
 CONNECTED_FLAG="${DATA_DIR}/connected"
 RESET_FLAG="${DATA_DIR}/reset"
@@ -28,31 +29,17 @@ mkdir -p /data/.local/share /data/.config /data/.cache
 : > "$QR_TXT"
 : > "$QR_ASCII"
 : > "$BRIAR_TAIL"
+touch "$CONTROL_LOG"
 echo "STARTING" > "$STATUS_TXT"
 
-log() { echo "[$(date -Is)] $*" >&2; }
+log() {
+  local msg="[$(date -Is)] $*"
+  echo "$msg" >&2
+  echo "$msg" >> "$CONTROL_LOG"
+}
 
 update_briar_tail() {
   tail -n 200 "$LOG" > "$BRIAR_TAIL" 2>/dev/null || true
-}
-
-mark_connected_flag_only() {
-  date -Is > "$CONNECTED_FLAG"
-  echo "CONNECTED" > "$STATUS_TXT"
-  : > "$QR_TXT"
-  : > "$QR_ASCII"
-  update_briar_tail
-}
-
-mark_pairing() {
-  rm -f "$CONNECTED_FLAG" 2>/dev/null || true
-  echo "PAIRING" > "$STATUS_TXT"
-  update_briar_tail
-}
-
-mark_running() {
-  echo "RUNNING" > "$STATUS_TXT"
-  update_briar_tail
 }
 
 consume_reset_request() {
@@ -61,53 +48,51 @@ consume_reset_request() {
   return 0
 }
 
-dump_data_tree() {
+dump_data_tree_to_control() {
   {
     echo "----- /data tree @ $(date -Is) -----"
-    # show top-level and hidden dirs/files
     ls -la /data || true
     echo
-    # show a shallow tree (2 levels)
-    find /data -maxdepth 2 -print 2>/dev/null | sed 's#^#/data#' || true
+    find /data -maxdepth 2 -print 2>/dev/null || true
     echo "-----------------------------------"
-  } >> "$BRIAR_TAIL" 2>/dev/null || true
+  } >> "$CONTROL_LOG"
 }
 
-hard_reset_wipe_data_dir() {
-  log "RESET: dumping /data before wipe..."
-  : > "$BRIAR_TAIL"
-  dump_data_tree
+hard_wipe_data_dir_except_ui() {
+  log "RESET: dumping /data BEFORE wipe..."
+  dump_data_tree_to_control
 
-  log "RESET: wiping /data state (preserving UI files)..."
+  log "RESET: wiping /data (preserve UI files only)..."
   echo "RESETTING" > "$STATUS_TXT"
 
-  # Stop showing stale pairing artifacts
   rm -f "$CONNECTED_FLAG" 2>/dev/null || true
   : > "$QR_TXT"
   : > "$QR_ASCII"
   : > "$LOG"
+  update_briar_tail
 
-  # Preserve allowlist by pruning them from deletion
-  # Delete everything else, including hidden files/dirs.
-  # IMPORTANT: this will remove Briar state wherever it is under /data.
+  # Preserve allowlist: index.html, status.txt, briar_tail.txt, control.log
+  # Delete everything else (including hidden). Use find prune to be explicit.
+  : > /tmp/reset_rm_err.log
+
   find /data -mindepth 1 \
-    \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/briar_tail.txt" \) -prune -o \
-    -exec rm -rf {} + 2>/tmp/reset_rm_err.log || true
+    \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/briar_tail.txt" -o -path "/data/control.log" \) -prune -o \
+    -exec rm -rf {} + 2>>/tmp/reset_rm_err.log || true
 
-  # Verify wipe: if anything besides allowlist remains, log it
+  # Verify leftovers (excluding allowlist)
   leftover="$(find /data -mindepth 1 \
-    \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/briar_tail.txt" \) -prune -o \
-    -print | head -n 50 || true)"
+    \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/briar_tail.txt" -o -path "/data/control.log" \) -prune -o \
+    -print | head -n 200 || true)"
 
   if [[ -n "$leftover" ]]; then
-    log "RESET WARNING: leftover items remain after wipe (first 50):"
-    log "$leftover"
+    log "RESET WARNING: leftover items after wipe (first 200):"
+    echo "$leftover" >> "$CONTROL_LOG"
     if [[ -s /tmp/reset_rm_err.log ]]; then
-      log "RESET rm errors:"
-      sed -n '1,120p' /tmp/reset_rm_err.log >&2 || true
+      log "RESET rm errors (first 200 lines):"
+      sed -n '1,200p' /tmp/reset_rm_err.log >> "$CONTROL_LOG" || true
     fi
   else
-    log "RESET: /data wipe appears clean."
+    log "RESET: wipe verification PASSED (no leftovers besides UI allowlist)."
   fi
 
   # Recreate dirs Briar expects
@@ -116,15 +101,16 @@ hard_reset_wipe_data_dir() {
   : > "$QR_TXT"
   : > "$QR_ASCII"
   : > "$LOG"
+  update_briar_tail
 
-  log "RESET: dumping /data after wipe..."
-  dump_data_tree
+  log "RESET: dumping /data AFTER wipe..."
+  dump_data_tree_to_control
 
   echo "STARTING" > "$STATUS_TXT"
-  log "RESET: complete."
+  log "RESET: wipe complete."
 }
 
-# --- UI (relative paths only for ingress) ---
+# --- UI ---
 cat > "$INDEX" <<'HTML'
 <!doctype html>
 <html>
@@ -151,7 +137,7 @@ cat > "$INDEX" <<'HTML'
 <body>
   <div class="wrap">
     <h2>Briar Mailbox</h2>
-    <p class="muted">No auto-refresh. Click Refresh while pairing. Reset forces a new pairing.</p>
+    <p class="muted">No auto-refresh. Click Refresh. Reset forces a new pairing.</p>
 
     <div class="card">
       <div class="row">
@@ -160,26 +146,16 @@ cat > "$INDEX" <<'HTML'
         <a class="btn btn-danger" href="reset" id="resetLink">Reset mailbox (force re-pair)</a>
       </div>
 
-      <div id="pairBlock" style="display:none; margin-top:12px;">
-        <h3>Pairing</h3>
-        <p class="muted">Scan the ASCII QR in Briar Android, or copy the desktop link.</p>
+      <h3>Control log</h3>
+      <pre id="ctl">(loading...)</pre>
 
-        <h4>ASCII QR</h4>
-        <pre id="ascii">(waiting...)</pre>
-
-        <h4>Desktop link</h4>
-        <code id="link">(waiting...)</code>
-      </div>
-
-      <h3>Runtime info</h3>
+      <h3>Briar log tail</h3>
       <pre id="logtail">(loading...)</pre>
     </div>
 
     <script>
       document.getElementById("resetLink").addEventListener("click", (e) => {
-        if (!confirm("Reset mailbox now? This will require pairing again.")) {
-          e.preventDefault();
-        }
+        if (!confirm("Reset mailbox now? This will require pairing again.")) e.preventDefault();
       });
 
       async function loadText(path) {
@@ -192,36 +168,18 @@ cat > "$INDEX" <<'HTML'
         let status = "STARTING";
         try { status = (await loadText("status.txt")).trim(); } catch {}
 
-        const stateTag = document.getElementById("stateTag");
-        const pairBlock = document.getElementById("pairBlock");
-
         const s = (status || "").toUpperCase();
-        const isPairing = s.startsWith("PAIRING");
-        const isResetting = s.startsWith("RESETTING");
-        const isConnected = s.startsWith("CONNECTED");
+        const tag = document.getElementById("stateTag");
+        if (s.startsWith("CONNECTED")) { tag.className="ok"; tag.textContent="CONNECTED"; }
+        else if (s.startsWith("PAIRING")) { tag.className="warn"; tag.textContent="PAIRING"; }
+        else if (s.startsWith("RESETTING")) { tag.className="warn"; tag.textContent="RESETTING"; }
+        else { tag.className="warn"; tag.textContent = status || "RUNNING"; }
 
-        if (isConnected) {
-          stateTag.className = "ok";
-          stateTag.textContent = "CONNECTED";
-          pairBlock.style.display = "none";
-        } else if (isPairing) {
-          stateTag.className = "warn";
-          stateTag.textContent = "PAIRING";
-          pairBlock.style.display = "block";
-
-          try { document.getElementById("link").textContent = (await loadText("mailbox.txt")).trim() || "(waiting...)"; }
-          catch { document.getElementById("link").textContent = "(error loading mailbox.txt)"; }
-
-          try { document.getElementById("ascii").textContent = (await loadText("qr_ascii.txt")).trim() || "(waiting...)"; }
-          catch { document.getElementById("ascii").textContent = "(error loading qr_ascii.txt)"; }
-        } else {
-          stateTag.className = "warn";
-          stateTag.textContent = isResetting ? "RESETTING" : (status || "RUNNING");
-          pairBlock.style.display = "none";
-        }
+        try { document.getElementById("ctl").textContent = (await loadText("control.log")).trim() || "(empty)"; }
+        catch { document.getElementById("ctl").textContent="(error loading control.log)"; }
 
         try { document.getElementById("logtail").textContent = (await loadText("briar_tail.txt")).trim() || "(empty)"; }
-        catch { document.getElementById("logtail").textContent = "(error loading briar_tail.txt)"; }
+        catch { document.getElementById("logtail").textContent="(error loading briar_tail.txt)"; }
       })();
     </script>
   </div>
@@ -263,100 +221,42 @@ PY
 python /tmp/server.py >"$HTTP_LOG" 2>&1 &
 log "HTTP server started on :8080. Logs: $HTTP_LOG"
 
-extract_ascii_qr() {
-  awk '
-    BEGIN {inside=0}
-    /Please scan this with the Briar Android app:/ {inside=1; next}
-    /Or copy and paste this into Briar Desktop:/ {inside=0}
-    inside==1 {print}
-  ' "$LOG" > "$QR_ASCII" 2>/dev/null || true
-
-  python - <<'PY'
-from pathlib import Path
-p = Path("/data/qr_ascii.txt")
-try:
-    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
-except FileNotFoundError:
-    lines = []
-while lines and not lines[0].strip():
-    lines.pop(0)
-while lines and not lines[-1].strip():
-    lines.pop()
-p.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-PY
-}
-
-update_pairing_url() {
-  local url=""
-  url="$(grep -Eo 'briar-mailbox://[^[:space:]]+' "$LOG" 2>/dev/null | tail -n 1 || true)"
-  if [[ -n "$url" ]]; then
-    echo "$url" > "$QR_TXT"
-  fi
-}
-
-saw_pairing_prompt() {
-  grep -q "Please scan this with the Briar Android app:" "$LOG" 2>/dev/null \
-  || grep -q "Or copy and paste this into Briar Desktop:" "$LOG" 2>/dev/null \
-  || grep -Eqo 'briar-mailbox://[^[:space:]]+' "$LOG" 2>/dev/null
-}
-
-tor_bootstrapped() {
-  grep -q "Bootstrapped 100% (done): Done" "$LOG" 2>/dev/null
-}
-
 BriarPID=""
 
 start_briar() {
   : > "$LOG"
+  update_briar_tail
   log "Starting Briar mailbox..."
-  echo "STARTING (launching Briar)" > "$STATUS_TXT"
-
-  set +e
+  echo "RUNNING" > "$STATUS_TXT"
   java -jar /app/briar-mailbox.jar 2>&1 | tee -a "$LOG" &
   BriarPID="$!"
-  set -e
-
   log "Briar PID: $BriarPID"
-  update_briar_tail
 }
-
-# consume any leftover marker from previous run
-consume_reset_request >/dev/null 2>&1 || true
 
 start_briar
 
-# Main loop
 while true; do
   if consume_reset_request; then
-    log "RESET: request consumed; restarting Briar with wiped /data."
-    kill "$BriarPID" 2>/dev/null || true
-    wait "$BriarPID" 2>/dev/null || true
+    log "RESET: request consumed; stopping Briar..."
+    set +e
+    kill "$BriarPID" 2>/dev/null
+    wait "$BriarPID" 2>/dev/null
+    set -e
 
-    hard_reset_wipe_data_dir
-
+    # Make reset path very loud
+    log "RESET: entering wipe function (set -x enabled for reset only)."
+    set -x
+    hard_wipe_data_dir_except_ui
+    set +x
+    log "RESET: restarting Briar..."
     start_briar
   fi
 
   if ! kill -0 "$BriarPID" 2>/dev/null; then
-    log "Briar exited unexpectedly; restarting..."
+    log "Briar exited; restarting..."
     echo "ERROR: Briar exited" > "$STATUS_TXT"
-    update_briar_tail
     sleep 2
     start_briar
-  fi
-
-  # If pairing prompts show up, present pairing
-  if saw_pairing_prompt; then
-    mark_pairing
-    update_pairing_url
-    extract_ascii_qr
-  else
-    # If you previously marked connected, keep it; otherwise just RUNNING
-    if [[ -f "$CONNECTED_FLAG" ]]; then
-      echo "CONNECTED" > "$STATUS_TXT"
-    else
-      mark_running
-    fi
   fi
 
   update_briar_tail

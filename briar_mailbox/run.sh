@@ -1,15 +1,11 @@
 #!/usr/bin/with-contenv bash
-# Robust run script for HA add-on:
-# - Ingress UI served from /data on :8080
-# - Shows PAIRING (ASCII QR + URL) when needed, otherwise CONNECTED
+# HA add-on run script with:
+# - Ingress UI on :8080 serving /data
+# - PAIRING vs CONNECTED detection
 # - Persistent connected flag (/data/connected)
-# - Reset button in UI triggers POST /reset:
-#     * stops Briar, wipes /data/.local/share /data/.config /data/.cache
-#     * clears /data/connected
-#     * restarts Briar and returns to pairing mode
-# - UI includes last 200 lines of Briar log (so you can debug from browser)
-#
-# IMPORTANT: This script must stay in the foreground; do not "exit" after starting web server.
+# - Reset button (POST /reset) that wipes Briar state + restarts Briar
+# - Log tail visible in UI (/data/briar_tail.txt)
+
 
 set -uo pipefail
 
@@ -66,7 +62,6 @@ do_reset_now() {
   log "RESET requested — wiping Briar state to force re-pairing..."
   echo "RESETTING" > "$STATUS_TXT"
 
-  # Stop exposing old pairing artifacts/status
   rm -f "$CONNECTED_FLAG" 2>/dev/null || true
   : > "$QR_TXT"
   : > "$QR_ASCII"
@@ -74,10 +69,8 @@ do_reset_now() {
   # Wipe Briar state (because HOME/XDG_* point to /data)
   rm -rf /data/.local/share/* /data/.config/* /data/.cache/* 2>/dev/null || true
 
-  # Clear the reset flag (one-shot)
   rm -f "$RESET_FLAG" 2>/dev/null || true
 
-  # Clear captured log so next run is clean
   : > "$LOG"
   update_briar_tail
   log "RESET complete."
@@ -188,7 +181,6 @@ cat > "$INDEX" <<'HTML'
         try {
           const r = await fetch("reset", { method: "POST", cache: "no-store" });
           if (!r.ok) throw new Error("HTTP " + r.status);
-          // Give it a moment to restart and write state/logs
           await new Promise(res => setTimeout(res, 800));
           location.reload();
         } catch (e) {
@@ -289,7 +281,6 @@ start_briar() {
   update_briar_tail
   log "Starting Briar mailbox..."
   echo "STARTING (launching Briar)" > "$STATUS_TXT"
-  # Run in background, capture PID
   java -jar /app/briar-mailbox.jar 2>&1 | tee -a "$LOG" &
   echo $!
 }
@@ -305,7 +296,7 @@ while true; do
 
   BriarPID="$(start_briar)"
 
-  # First: decide CONNECTED vs PAIRING within 60s, while honoring RESET at any time.
+  # Decide CONNECTED vs PAIRING within 60s, while honoring RESET at any time.
   decided="no"
   for _ in $(seq 1 60); do
     if [[ -f "$RESET_FLAG" ]]; then
@@ -313,14 +304,14 @@ while true; do
       kill "$BriarPID" 2>/dev/null || true
       wait "$BriarPID" 2>/dev/null || true
       do_reset_now
-      decided="yes"
+      decided="reset"
       break
     fi
 
     if ! kill -0 "$BriarPID" 2>/dev/null; then
       echo "ERROR: Briar exited" > "$STATUS_TXT"
       update_briar_tail
-      decided="yes"
+      decided="dead"
       break
     fi
 
@@ -329,14 +320,14 @@ while true; do
       update_pairing_url
       extract_ascii_qr
       update_briar_tail
-      decided="yes"
+      decided="pairing"
       break
     fi
 
     if tor_bootstrapped; then
       mark_connected
       update_briar_tail
-      decided="yes"
+      decided="connected"
       break
     fi
 
@@ -344,14 +335,14 @@ while true; do
     sleep 1
   done
 
-  # If we reset or Briar died, restart outer loop
-  if [[ "$decided" == "yes" && -f "$RESET_FLAG" ]]; then
-    # (do_reset_now already cleared it, but be safe)
-    rm -f "$RESET_FLAG" 2>/dev/null || true
+  # If reset happened, restart outer loop
+  if [[ "$decided" == "reset" ]]; then
     sleep 1
     continue
   fi
-  if [[ "$decided" == "yes" && ! kill -0 "$BriarPID" 2>/dev/null ]]; then
+
+  # If Briar died, restart outer loop
+  if [[ "$decided" == "dead" ]]; then
     sleep 2
     continue
   fi
@@ -365,13 +356,13 @@ while true; do
         kill "$BriarPID" 2>/dev/null || true
         wait "$BriarPID" 2>/dev/null || true
         do_reset_now
+        stable_connected=0
         break
       fi
 
       update_pairing_url
       extract_ascii_qr
 
-      # Flip to CONNECTED when pairing prompt disappears and Tor is up for ~10s
       if ! saw_pairing_prompt && tor_bootstrapped; then
         stable_connected=$((stable_connected + 1))
       else
@@ -387,6 +378,13 @@ while true; do
       update_briar_tail
       sleep 1
     done
+
+    # If reset happened in pairing loop, restart outer loop
+    if [[ -f "$RESET_FLAG" ]]; then
+      rm -f "$RESET_FLAG" 2>/dev/null || true
+      sleep 1
+      continue
+    fi
   fi
 
   # Steady-state: keep Briar alive, allow reset, update log tail

@@ -8,7 +8,7 @@ QR_TXT="${DATA_DIR}/mailbox.txt"
 QR_ASCII="${DATA_DIR}/qr_ascii.txt"
 STATUS_TXT="${DATA_DIR}/status.txt"
 CONNECTED_FLAG="${DATA_DIR}/connected"   # persists across restarts
-RESET_FLAG="${DATA_DIR}/reset"           # create this file to force re-pairing
+RESET_FLAG="${DATA_DIR}/reset"           # set by web UI POST /reset
 HTTP_LOG="/tmp/http.log"
 
 mkdir -p "$DATA_DIR"
@@ -21,28 +21,7 @@ export XDG_CONFIG_HOME=/data/.config
 export XDG_CACHE_HOME=/data/.cache
 mkdir -p /data/.local/share /data/.config /data/.cache
 
-# Reset option:
-# Create /data/reset (empty file is fine), then restart the add-on.
-# This will wipe Briar's persisted state under /data and force a new pairing QR/URL.
-if [[ -f "$RESET_FLAG" ]]; then
-  echo "RESET requested via $RESET_FLAG — wiping Briar state to force re-pairing..."
-
-  # Clear UI state + pairing artifacts
-  rm -f "$CONNECTED_FLAG" 2>/dev/null || true
-  : > "$QR_TXT"
-  : > "$QR_ASCII"
-  echo "RESETTING" > "$STATUS_TXT"
-
-  # Wipe Briar state (because HOME/XDG_* point to /data)
-  rm -rf /data/.local/share/* /data/.config/* /data/.cache/* 2>/dev/null || true
-
-  # Remove the reset flag so it only runs once
-  rm -f "$RESET_FLAG" 2>/dev/null || true
-
-  echo "RESET complete. Starting fresh..."
-fi
-
-# Placeholders so Ingress never 404s
+# Placeholders so ingress never 404s
 : > "$QR_TXT"
 : > "$QR_ASCII"
 echo "STARTING" > "$STATUS_TXT"
@@ -58,6 +37,26 @@ mark_connected() {
 mark_pairing() {
   rm -f "$CONNECTED_FLAG" 2>/dev/null || true
   echo "PAIRING" > "$STATUS_TXT"
+}
+
+do_reset_now() {
+  echo "RESET requested — wiping Briar state to force re-pairing..."
+
+  echo "RESETTING" > "$STATUS_TXT"
+
+  # Stop exposing old pairing artifacts/status
+  rm -f "$CONNECTED_FLAG" 2>/dev/null || true
+  : > "$QR_TXT"
+  : > "$QR_ASCII"
+
+  # Wipe Briar state (because HOME/XDG_* point to /data)
+  rm -rf /data/.local/share/* /data/.config/* /data/.cache/* 2>/dev/null || true
+
+  # Clear the reset flag (one-shot)
+  rm -f "$RESET_FLAG" 2>/dev/null || true
+
+  : > "$LOG"
+  echo "RESET complete."
 }
 
 # HTML (relative paths only — HA ingress)
@@ -78,16 +77,22 @@ cat > "$INDEX" <<'HTML'
     code { word-break: break-all; display:block; padding:12px; border:1px solid #ccc; border-radius:8px; background:#f7f7f7; }
     .ok { display:inline-block; padding:6px 10px; border-radius:999px; background:#e9f7ef; border:1px solid #bfe8cf; }
     .warn { display:inline-block; padding:6px 10px; border-radius:999px; background:#fff6e5; border:1px solid #ffe0a3; }
-    .btn { display:inline-block; margin-top:10px; padding:10px 12px; border:1px solid #ccc; border-radius:10px; background:#f7f7f7; text-decoration:none; color:#000; }
+    .btn { display:inline-block; margin-top:10px; padding:10px 12px; border:1px solid #ccc; border-radius:10px; background:#f7f7f7; text-decoration:none; color:#000; cursor:pointer; }
+    .btn-danger { border-color:#f1b0b7; background:#fff0f2; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h2>Briar Mailbox</h2>
-    <p class="muted">This page does not auto-refresh. Use Refresh while pairing.</p>
+    <p class="muted">No auto-refresh. Use Refresh while pairing. Use Reset to force re-pairing.</p>
 
     <div class="card">
-      <div id="stateTag" class="warn">Loading…</div>
+      <div class="row">
+        <div id="stateTag" class="warn">Loading…</div>
+        <a class="btn" href="./">Refresh</a>
+        <button class="btn btn-danger" id="resetBtn" type="button">Reset mailbox (force re-pair)</button>
+      </div>
 
       <div id="connectedBlock" style="display:none; margin-top:12px;">
         <h3>Connected</h3>
@@ -104,8 +109,6 @@ cat > "$INDEX" <<'HTML'
         <h4>Desktop link</h4>
         <code id="link">(waiting...)</code>
       </div>
-
-      <a class="btn" href="./">Refresh</a>
     </div>
 
     <script>
@@ -115,7 +118,7 @@ cat > "$INDEX" <<'HTML'
         return (await r.text()).trim();
       }
 
-      (async () => {
+      async function refreshUI() {
         let status = "STARTING";
         try { status = await loadText("status.txt"); } catch {}
 
@@ -126,6 +129,7 @@ cat > "$INDEX" <<'HTML'
         const s = (status || "").toUpperCase();
         const isConnected = s.startsWith("CONNECTED");
         const isPairing   = s.startsWith("PAIRING");
+        const isResetting = s.startsWith("RESETTING");
 
         if (isConnected) {
           stateTag.className = "ok";
@@ -136,7 +140,7 @@ cat > "$INDEX" <<'HTML'
         }
 
         stateTag.className = "warn";
-        stateTag.textContent = isPairing ? "PAIRING" : (status || "STARTING");
+        stateTag.textContent = isResetting ? "RESETTING" : (isPairing ? "PAIRING" : (status || "STARTING"));
         connectedBlock.style.display = "none";
         pairBlock.style.display = isPairing ? "block" : "none";
 
@@ -147,17 +151,36 @@ cat > "$INDEX" <<'HTML'
           try { document.getElementById("ascii").textContent = await loadText("qr_ascii.txt") || "(waiting...)"; }
           catch { document.getElementById("ascii").textContent = "(error loading qr_ascii.txt)"; }
         }
-      })();
+      }
+
+      document.getElementById("resetBtn").addEventListener("click", async () => {
+        if (!confirm("Reset mailbox now? This will unlink all clients and require pairing again.")) return;
+
+        try {
+          const r = await fetch("reset", { method: "POST", cache: "no-store" });
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          // Give the add-on a moment to restart Briar and update status.
+          await new Promise(res => setTimeout(res, 1500));
+          location.reload();
+        } catch (e) {
+          alert("Reset failed: " + e);
+        }
+      });
+
+      refreshUI();
     </script>
   </div>
 </body>
 </html>
 HTML
 
-# Serve /data on 8080 (Ingress-safe)
+# Serve /data on 8080 (Ingress-safe) + reset endpoint
 cat > /tmp/server.py <<'PY'
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 import os
+
+DATA_DIR = "/data"
+RESET_FLAG = os.path.join(DATA_DIR, "reset")
 
 class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -165,17 +188,32 @@ class Handler(SimpleHTTPRequestHandler):
             self.path = "/index.html"
         return super().do_GET()
 
-os.chdir("/data")
+    def do_POST(self):
+        if self.path.rstrip("/") == "/reset":
+            # Create a flag file; run.sh will detect and perform reset.
+            try:
+                with open(RESET_FLAG, "w", encoding="utf-8") as f:
+                    f.write("reset\n")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"OK\n")
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(("ERROR: %s\n" % e).encode("utf-8"))
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+os.chdir(DATA_DIR)
 HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
 PY
 
 python /tmp/server.py >"$HTTP_LOG" 2>&1 &
 echo "HTTP server started on :8080. Logs: $HTTP_LOG"
-
-# Start Briar mailbox (log captured)
-echo "Starting Briar mailbox..."
-java -jar /app/briar-mailbox.jar 2>&1 | tee -a "$LOG" &
-BriarPID=$!
 
 extract_ascii_qr() {
   awk '
@@ -212,71 +250,105 @@ saw_pairing_prompt() {
 }
 
 tor_bootstrapped() {
-  # Your “already configured” logs reliably include this line:
   grep -q "Bootstrapped 100% (done): Done" "$LOG"
 }
 
-# Default UI state based on persisted flag
-if [[ -f "$CONNECTED_FLAG" ]]; then
-  echo "CONNECTED (flag)" > "$STATUS_TXT"
-else
-  echo "STARTING" > "$STATUS_TXT"
-fi
+start_briar() {
+  : > "$LOG"
+  echo "Starting Briar mailbox..."
+  java -jar /app/briar-mailbox.jar 2>&1 | tee -a "$LOG" &
+  echo $!
+}
 
-# Wait up to ~60 seconds to decide state from logs
-for i in $(seq 1 60); do
-  if ! kill -0 "$BriarPID" 2>/dev/null; then
-    echo "ERROR: Briar exited" > "$STATUS_TXT"
-    break
+# Main loop: keep Briar running; allow reset via /reset button at any time.
+while true; do
+  # Default UI state based on persisted flag
+  if [[ -f "$CONNECTED_FLAG" ]]; then
+    echo "CONNECTED (flag)" > "$STATUS_TXT"
+  else
+    echo "STARTING" > "$STATUS_TXT"
   fi
 
-  # If we ever see pairing prompts, we are NOT connected anymore (reset/re-pair case)
-  if saw_pairing_prompt; then
-    mark_pairing
-    update_pairing_url
-    extract_ascii_qr
-    break
-  fi
+  BriarPID="$(start_briar)"
 
-  # If Tor is bootstrapped and no pairing prompts, consider it connected
-  if tor_bootstrapped; then
-    mark_connected
-    break
-  fi
+  # Decide state from logs (up to ~60 seconds)
+  for i in $(seq 1 60); do
+    # Reset requested?
+    if [[ -f "$RESET_FLAG" ]]; then
+      kill "$BriarPID" 2>/dev/null || true
+      wait "$BriarPID" 2>/dev/null || true
+      do_reset_now
+      # restart loop (fresh instance)
+      continue 2
+    fi
 
-  sleep 1
-done
-
-# If we entered PAIRING, keep updating artifacts until it becomes connected
-if grep -q "^PAIRING" "$STATUS_TXT"; then
-  echo "Pairing mode: updating ASCII + URL..."
-  stable_connected_count=0
-
-  while true; do
     if ! kill -0 "$BriarPID" 2>/dev/null; then
       echo "ERROR: Briar exited" > "$STATUS_TXT"
       break
     fi
 
-    update_pairing_url
-    extract_ascii_qr
-
-    # If pairing prompt is gone and Tor is fully up, assume paired/connected.
-    if ! saw_pairing_prompt && tor_bootstrapped; then
-      stable_connected_count=$((stable_connected_count + 1))
-    else
-      stable_connected_count=0
+    if saw_pairing_prompt; then
+      mark_pairing
+      update_pairing_url
+      extract_ascii_qr
+      break
     fi
 
-    # Require ~10 seconds of stable “no pairing prompt + tor up” to flip state.
-    if [[ "$stable_connected_count" -ge 10 ]]; then
+    if tor_bootstrapped; then
       mark_connected
-      echo "Detected connected state. Pairing details cleared."
       break
     fi
 
     sleep 1
   done
-fi
 
-wait "$BriarPID"
+  # If pairing, keep updating until connected OR reset OR Briar exits
+  if grep -q "^PAIRING" "$STATUS_TXT"; then
+    stable_connected_count=0
+    while true; do
+      if [[ -f "$RESET_FLAG" ]]; then
+        kill "$BriarPID" 2>/dev/null || true
+        wait "$BriarPID" 2>/dev/null || true
+        do_reset_now
+        continue 2
+      fi
+
+      if ! kill -0 "$BriarPID" 2>/dev/null; then
+        echo "ERROR: Briar exited" > "$STATUS_TXT"
+        break
+      fi
+
+      update_pairing_url
+      extract_ascii_qr
+
+      if ! saw_pairing_prompt && tor_bootstrapped; then
+        stable_connected_count=$((stable_connected_count + 1))
+      else
+        stable_connected_count=0
+      fi
+
+      if [[ "$stable_connected_count" -ge 10 ]]; then
+        mark_connected
+        echo "Detected connected state. Pairing details cleared."
+        break
+      fi
+
+      sleep 1
+    done
+  fi
+
+  # If connected, just keep running; still allow reset button.
+  while kill -0 "$BriarPID" 2>/dev/null; do
+    if [[ -f "$RESET_FLAG" ]]; then
+      kill "$BriarPID" 2>/dev/null || true
+      wait "$BriarPID" 2>/dev/null || true
+      do_reset_now
+      continue 2
+    fi
+    sleep 1
+  done
+
+  # Briar exited unexpectedly; loop will restart it.
+  echo "Briar exited; restarting..."
+  sleep 2
+done

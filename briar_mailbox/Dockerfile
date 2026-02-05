@@ -13,6 +13,7 @@ WORKDIR /build
 
 RUN git clone --depth=1 https://code.briarproject.org/briar/briar-mailbox.git . \
   && ./gradlew --no-daemon x86LinuxJar \
+  && mkdir -p /out \
   && cp mailbox-cli/build/libs/mailbox-cli-linux-x86_64.jar /out/briar-mailbox.jar
 
 # -------------------------

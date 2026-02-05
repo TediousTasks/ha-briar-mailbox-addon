@@ -36,7 +36,7 @@ update_briar_tail() {
   tail -n 200 "$LOG" > "$BRIAR_TAIL" 2>/dev/null || true
 }
 
-mark_connected() {
+mark_connected_flag_only() {
   date -Is > "$CONNECTED_FLAG"
   echo "CONNECTED" > "$STATUS_TXT"
   : > "$QR_TXT"
@@ -50,52 +50,65 @@ mark_pairing() {
   update_briar_tail
 }
 
-mark_unknown() {
+mark_running() {
   echo "RUNNING" > "$STATUS_TXT"
   update_briar_tail
 }
 
 consume_reset_request() {
   [[ -f "$RESET_FLAG" ]] || return 1
-  # delete immediately (one-shot)
   rm -f "$RESET_FLAG" 2>/dev/null || true
   return 0
 }
 
-# Reset must wipe EVERYTHING in /data except a few UI files.
-reset_wipe_data_dir() {
-  log "RESET: wiping /data state (preserving UI files)..."
+dump_data_tree() {
+  {
+    echo "----- /data tree @ $(date -Is) -----"
+    # show top-level and hidden dirs/files
+    ls -la /data || true
+    echo
+    # show a shallow tree (2 levels)
+    find /data -maxdepth 2 -print 2>/dev/null | sed 's#^#/data#' || true
+    echo "-----------------------------------"
+  } >> "$BRIAR_TAIL" 2>/dev/null || true
+}
 
-  # Stop showing stale stuff
-  rm -f "$CONNECTED_FLAG" 2>/dev/null || true
+hard_reset_wipe_data_dir() {
+  log "RESET: dumping /data before wipe..."
+  : > "$BRIAR_TAIL"
+  dump_data_tree
+
+  log "RESET: wiping /data state (preserving UI files)..."
   echo "RESETTING" > "$STATUS_TXT"
+
+  # Stop showing stale pairing artifacts
+  rm -f "$CONNECTED_FLAG" 2>/dev/null || true
   : > "$QR_TXT"
   : > "$QR_ASCII"
   : > "$LOG"
-  update_briar_tail
 
-  # Preserve allowlist by moving to temp
-  tmp="/tmp/preserve.$$"
-  mkdir -p "$tmp"
+  # Preserve allowlist by pruning them from deletion
+  # Delete everything else, including hidden files/dirs.
+  # IMPORTANT: this will remove Briar state wherever it is under /data.
+  find /data -mindepth 1 \
+    \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/briar_tail.txt" \) -prune -o \
+    -exec rm -rf {} + 2>/tmp/reset_rm_err.log || true
 
-  for f in "index.html" "status.txt" "briar_tail.txt"; do
-    if [[ -f "${DATA_DIR}/${f}" ]]; then
-      mv "${DATA_DIR}/${f}" "${tmp}/${f}" 2>/dev/null || true
+  # Verify wipe: if anything besides allowlist remains, log it
+  leftover="$(find /data -mindepth 1 \
+    \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/briar_tail.txt" \) -prune -o \
+    -print | head -n 50 || true)"
+
+  if [[ -n "$leftover" ]]; then
+    log "RESET WARNING: leftover items remain after wipe (first 50):"
+    log "$leftover"
+    if [[ -s /tmp/reset_rm_err.log ]]; then
+      log "RESET rm errors:"
+      sed -n '1,120p' /tmp/reset_rm_err.log >&2 || true
     fi
-  done
-
-  # Nuke everything else in /data (including hidden dirs)
-  # shellcheck disable=SC2115
-  rm -rf "${DATA_DIR:?}/"* "${DATA_DIR}"/.[!.]* "${DATA_DIR}"/..?* 2>/dev/null || true
-
-  # Restore allowlist
-  mkdir -p "$DATA_DIR"
-  for f in "index.html" "status.txt" "briar_tail.txt"; do
-    if [[ -f "${tmp}/${f}" ]]; then
-      mv "${tmp}/${f}" "${DATA_DIR}/${f}" 2>/dev/null || true
-    fi
-  done
-  rm -rf "$tmp" 2>/dev/null || true
+  else
+    log "RESET: /data wipe appears clean."
+  fi
 
   # Recreate dirs Briar expects
   mkdir -p /data/.local/share /data/.config /data/.cache
@@ -103,9 +116,12 @@ reset_wipe_data_dir() {
   : > "$QR_TXT"
   : > "$QR_ASCII"
   : > "$LOG"
-  : > "$BRIAR_TAIL"
+
+  log "RESET: dumping /data after wipe..."
+  dump_data_tree
+
   echo "STARTING" > "$STATUS_TXT"
-  log "RESET: wipe complete."
+  log "RESET: complete."
 }
 
 # --- UI (relative paths only for ingress) ---
@@ -144,11 +160,6 @@ cat > "$INDEX" <<'HTML'
         <a class="btn btn-danger" href="reset" id="resetLink">Reset mailbox (force re-pair)</a>
       </div>
 
-      <div id="connectedBlock" style="display:none; margin-top:12px;">
-        <h3>Connected</h3>
-        <p class="muted">Mailbox is configured. Pairing details are hidden.</p>
-      </div>
-
       <div id="pairBlock" style="display:none; margin-top:12px;">
         <h3>Pairing</h3>
         <p class="muted">Scan the ASCII QR in Briar Android, or copy the desktop link.</p>
@@ -160,7 +171,7 @@ cat > "$INDEX" <<'HTML'
         <code id="link">(waiting...)</code>
       </div>
 
-      <h3>Runtime log (last 200 lines)</h3>
+      <h3>Runtime info</h3>
       <pre id="logtail">(loading...)</pre>
     </div>
 
@@ -182,23 +193,20 @@ cat > "$INDEX" <<'HTML'
         try { status = (await loadText("status.txt")).trim(); } catch {}
 
         const stateTag = document.getElementById("stateTag");
-        const connectedBlock = document.getElementById("connectedBlock");
         const pairBlock = document.getElementById("pairBlock");
 
         const s = (status || "").toUpperCase();
-        const isConnected = s.startsWith("CONNECTED");
-        const isPairing   = s.startsWith("PAIRING");
+        const isPairing = s.startsWith("PAIRING");
         const isResetting = s.startsWith("RESETTING");
+        const isConnected = s.startsWith("CONNECTED");
 
         if (isConnected) {
           stateTag.className = "ok";
           stateTag.textContent = "CONNECTED";
-          connectedBlock.style.display = "block";
           pairBlock.style.display = "none";
         } else if (isPairing) {
           stateTag.className = "warn";
           stateTag.textContent = "PAIRING";
-          connectedBlock.style.display = "none";
           pairBlock.style.display = "block";
 
           try { document.getElementById("link").textContent = (await loadText("mailbox.txt")).trim() || "(waiting...)"; }
@@ -209,7 +217,6 @@ cat > "$INDEX" <<'HTML'
         } else {
           stateTag.className = "warn";
           stateTag.textContent = isResetting ? "RESETTING" : (status || "RUNNING");
-          connectedBlock.style.display = "none";
           pairBlock.style.display = "none";
         }
 
@@ -222,7 +229,7 @@ cat > "$INDEX" <<'HTML'
 </html>
 HTML
 
-# --- web server: GET /reset drops a marker then redirects back ---
+# --- web server: GET /reset drops marker then redirects back ---
 cat > /tmp/server.py <<'PY'
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 import os, time
@@ -301,7 +308,6 @@ BriarPID=""
 
 start_briar() {
   : > "$LOG"
-  update_briar_tail
   log "Starting Briar mailbox..."
   echo "STARTING (launching Briar)" > "$STATUS_TXT"
 
@@ -314,69 +320,45 @@ start_briar() {
   update_briar_tail
 }
 
-# consume any leftover reset marker from previous run
+# consume any leftover marker from previous run
 consume_reset_request >/dev/null 2>&1 || true
 
+start_briar
+
+# Main loop
 while true; do
-  # Show persisted connected state if you previously marked it
-  if [[ -f "$CONNECTED_FLAG" ]]; then
-    echo "CONNECTED (flag)" > "$STATUS_TXT"
-  else
-    echo "RUNNING" > "$STATUS_TXT"
+  if consume_reset_request; then
+    log "RESET: request consumed; restarting Briar with wiped /data."
+    kill "$BriarPID" 2>/dev/null || true
+    wait "$BriarPID" 2>/dev/null || true
+
+    hard_reset_wipe_data_dir
+
+    start_briar
   fi
 
-  start_briar
-
-  # If we *ever* see pairing prompts, we go PAIRING and keep updating artifacts.
-  # If we do NOT see pairing prompts, we do NOT auto-assume connected (Tor alone is meaningless).
-  # Connected is only asserted if:
-  #   - connected flag already exists, OR
-  #   - we saw pairing prompts earlier in this run and they have been absent stably while Tor is up.
-  saw_pair_ever="no"
-  stable_no_pair=0
-
-  while kill -0 "$BriarPID" 2>/dev/null; do
-    if consume_reset_request; then
-      log "RESET: request consumed; restarting Briar with wiped /data."
-      kill "$BriarPID" 2>/dev/null || true
-      wait "$BriarPID" 2>/dev/null || true
-      reset_wipe_data_dir
-      break
-    fi
-
-    if saw_pairing_prompt; then
-      saw_pair_ever="yes"
-      mark_pairing
-      update_pairing_url
-      extract_ascii_qr
-      stable_no_pair=0
-    else
-      stable_no_pair=$((stable_no_pair + 1))
-    fi
-
-    # Only transition to CONNECTED if we *previously* saw pairing prompts in this run,
-    # and now they're gone for ~15s while Tor is up (post-pair stabilization).
-    if [[ "$saw_pair_ever" == "yes" ]] && tor_bootstrapped && [[ "$stable_no_pair" -ge 15 ]]; then
-      mark_connected
-    fi
-
-    # If we are in PAIRING, keep artifacts updated. If not pairing and not connected,
-    # just keep status as RUNNING/CONNECTED(flag).
-    if grep -q "^PAIRING" "$STATUS_TXT" 2>/dev/null; then
-      update_pairing_url
-      extract_ascii_qr
-    elif [[ -f "$CONNECTED_FLAG" ]]; then
-      echo "CONNECTED (flag)" > "$STATUS_TXT"
-    else
-      mark_unknown
-    fi
-
+  if ! kill -0 "$BriarPID" 2>/dev/null; then
+    log "Briar exited unexpectedly; restarting..."
+    echo "ERROR: Briar exited" > "$STATUS_TXT"
     update_briar_tail
     sleep 2
-  done
+    start_briar
+  fi
 
-  log "Briar exited; restarting in 2s..."
-  echo "ERROR: Briar exited" > "$STATUS_TXT"
+  # If pairing prompts show up, present pairing
+  if saw_pairing_prompt; then
+    mark_pairing
+    update_pairing_url
+    extract_ascii_qr
+  else
+    # If you previously marked connected, keep it; otherwise just RUNNING
+    if [[ -f "$CONNECTED_FLAG" ]]; then
+      echo "CONNECTED" > "$STATUS_TXT"
+    else
+      mark_running
+    fi
+  fi
+
   update_briar_tail
   sleep 2
 done

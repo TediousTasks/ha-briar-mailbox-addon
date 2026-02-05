@@ -1,36 +1,30 @@
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:latest
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:latest
 
-# -------- Build stage (compile fat JAR) --------
+# -------- Build stage --------
 FROM ${BUILD_FROM} AS builder
 
-RUN apk add --no-cache \
-    bash \
-    git \
-    openjdk17-jdk \
-    unzip \
-    ca-certificates \
-  && update-ca-certificates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash git unzip ca-certificates openjdk-17-jdk \
+  && update-ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
+RUN git clone --depth=1 https://code.briarproject.org/briar/briar-mailbox.git .
 
-RUN git clone --depth=1 https://code.briarproject.org/briar/briar-mailbox.git . \
-  && ./gradlew --no-daemon x86LinuxJar \
-  && test -f mailbox-cli/build/libs/mailbox-cli-linux-x86_64.jar \
-  && mkdir -p /out \
-  && cp mailbox-cli/build/libs/mailbox-cli-linux-x86_64.jar /out/briar-mailbox.jar
+RUN ./gradlew --no-daemon x86LinuxJar \
+ && test -f mailbox-cli/build/libs/mailbox-cli-linux-x86_64.jar \
+ && mkdir -p /out \
+ && cp mailbox-cli/build/libs/mailbox-cli-linux-x86_64.jar /out/briar-mailbox.jar
 
 # -------- Runtime stage --------
 FROM ${BUILD_FROM}
 
-RUN apk add --no-cache \
-    bash \
-    openjdk17-jre \
-    ca-certificates \
-  && update-ca-certificates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash ca-certificates openjdk-17-jre-headless \
+  && update-ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
-#Copy from /out (created in builder stage)
 COPY --from=builder /out/briar-mailbox.jar /app/briar-mailbox.jar
-
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 

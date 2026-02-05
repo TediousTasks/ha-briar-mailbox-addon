@@ -1,4 +1,4 @@
-# Home Assistant App (Add-on): Briar Mailbox server
+# Home Assistant App (Add-on): Briar Mailbox
 
 The Briar Mailbox project aims to develop an easy way for Briar users to increase their 
 reachability and lower the battery drain of their phone.

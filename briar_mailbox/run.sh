@@ -36,9 +36,63 @@ consume_reset_request() {
   return 0
 }
 
+fix_data_permissions() {
+  local uid gid
+  uid="$(id -u)"
+  gid="$(id -g)"
+  mkdir -p /data/.local/share /data/.config /data/.cache
+  chown -R "${uid}:${gid}" /data 2>/dev/null || true
+  chmod 755 /data 2>/dev/null || true
+  chmod 700 /data/.config /data/.cache 2>/dev/null || true
+  chmod -R u+rwX /data/.local 2>/dev/null || true
+}
+
+# Kill any orphaned tor/proxy processes that might survive Java exit
+kill_orphan_tor() {
+  # Only within this container; keep it targeted.
+  # onionwrapper installs tor binaries under /data, so matching /data.*tor is safe.
+  local patterns=(
+    "/data/.*/tor"
+    "/data/.*/obfs4proxy"
+    "/data/.*/snowflake"
+    "obfs4proxy"
+    "snowflake"
+  )
+
+  local killed_any="no"
+  for pat in "${patterns[@]}"; do
+    local pids=""
+    pids="$(pgrep -f "$pat" 2>/dev/null || true)"
+    if [[ -n "$pids" ]]; then
+      killed_any="yes"
+      log "Cleanup: TERM pids for pattern '$pat': $pids"
+      kill $pids 2>/dev/null || true
+    fi
+  done
+
+  # Give them a moment to die cleanly
+  sleep 1
+
+  # Hard kill anything still around
+  for pat in "${patterns[@]}"; do
+    local pids=""
+    pids="$(pgrep -f "$pat" 2>/dev/null || true)"
+    if [[ -n "$pids" ]]; then
+      log "Cleanup: KILL pids for pattern '$pat': $pids"
+      kill -9 $pids 2>/dev/null || true
+    fi
+  done
+
+  # Ensure ports/locks have time to clear
+  if [[ "$killed_any" == "yes" ]]; then
+    sleep 1
+  fi
+}
+
 stop_briar_hard() {
   local pid="${1:-}"
   [[ -n "$pid" ]] || return 0
+
   if ! kill -0 "$pid" 2>/dev/null; then
     return 0
   fi
@@ -46,33 +100,21 @@ stop_briar_hard() {
   log "Stop: SIGTERM $pid"
   kill "$pid" 2>/dev/null || true
 
-  for _ in $(seq 1 10); do
+  for _ in $(seq 1 12); do
     if ! kill -0 "$pid" 2>/dev/null; then
-      return 0
+      break
     fi
     sleep 0.5
   done
 
-  log "Stop: SIGKILL $pid"
-  kill -9 "$pid" 2>/dev/null || true
-  for _ in $(seq 1 10); do
-    if ! kill -0 "$pid" 2>/dev/null; then
-      return 0
-    fi
+  if kill -0 "$pid" 2>/dev/null; then
+    log "Stop: SIGKILL $pid"
+    kill -9 "$pid" 2>/dev/null || true
     sleep 0.5
-  done
-}
+  fi
 
-fix_data_permissions() {
-  local uid gid
-  uid="$(id -u)"
-  gid="$(id -g)"
-
-  mkdir -p /data/.local/share /data/.config /data/.cache
-  chown -R "${uid}:${gid}" /data 2>/dev/null || true
-  chmod 755 /data 2>/dev/null || true
-  chmod 700 /data/.config /data/.cache 2>/dev/null || true
-  chmod -R u+rwX /data/.local 2>/dev/null || true
+  # Critical: clean up tor/proxy processes that may outlive Java
+  kill_orphan_tor
 }
 
 wipe_data_dir_preserve_ui() {
@@ -89,6 +131,9 @@ wipe_data_dir_preserve_ui() {
 
   mkdir -p /data/.local/share /data/.config /data/.cache
   fix_data_permissions
+
+  # Extra safety: after wipe, make sure nothing tor-like is running
+  kill_orphan_tor
 
   echo "STARTING" > "$STATUS_TXT"
 }
@@ -173,7 +218,7 @@ cat > "$INDEX" <<'HTML'
 
       <div id="connectedBlock" style="display:none; margin-top:14px;">
         <h3>Connected</h3>
-        <p class="muted">This mailbox appears to already be configured.</p>
+        <p class="muted">This mailbox appears to already be configured and running.</p>
       </div>
 
       <div id="pairBlock" style="display:none; margin-top:14px;">
@@ -190,6 +235,11 @@ cat > "$INDEX" <<'HTML'
       <div id="startingBlock" style="display:none; margin-top:14px;">
         <h3>Starting</h3>
         <p class="muted">Briar is starting up. Refresh in a few seconds.</p>
+      </div>
+
+      <div id="errorBlock" style="display:none; margin-top:14px;">
+        <h3>Error</h3>
+        <p class="muted">Briar failed to start. Try Reset.</p>
       </div>
     </div>
 
@@ -212,6 +262,7 @@ cat > "$INDEX" <<'HTML'
         const connected = document.getElementById("connectedBlock");
         const pairing = document.getElementById("pairBlock");
         const starting = document.getElementById("startingBlock");
+        const error = document.getElementById("errorBlock");
 
         const s = (status || "").toUpperCase();
 
@@ -219,6 +270,7 @@ cat > "$INDEX" <<'HTML'
           connected.style.display = which === "connected" ? "block" : "none";
           pairing.style.display   = which === "pairing"   ? "block" : "none";
           starting.style.display  = which === "starting"  ? "block" : "none";
+          error.style.display     = which === "error"     ? "block" : "none";
         }
 
         if (s.startsWith("CONNECTED")) {
@@ -239,6 +291,13 @@ cat > "$INDEX" <<'HTML'
           try { document.getElementById("link").textContent = await loadText("mailbox.txt") || "(waiting...)"; }
           catch { document.getElementById("link").textContent = "(error loading mailbox.txt)"; }
 
+          return;
+        }
+
+        if (s.startsWith("ERROR")) {
+          tag.className = "tag warn";
+          tag.textContent = "ERROR";
+          show("error");
           return;
         }
 
@@ -295,6 +354,7 @@ start_briar() {
   echo "STARTING" > "$STATUS_TXT"
 
   fix_data_permissions
+  kill_orphan_tor
 
   log "Starting Briar mailbox..."
   java -jar /app/briar-mailbox.jar 2>&1 | tee -a "$LOG" &
@@ -302,9 +362,7 @@ start_briar() {
   log "Briar PID: $BriarPID"
 }
 
-# Decide CONNECTED vs PAIRING based on logs
 decide_state_window() {
-  # Wait up to ~60 seconds to decide initial state
   for _ in $(seq 1 60); do
     if ! kill -0 "$BriarPID" 2>/dev/null; then
       echo "ERROR" > "$STATUS_TXT"
@@ -326,17 +384,12 @@ decide_state_window() {
     sleep 1
   done
 
-  # If undecided, keep STARTING
   echo "STARTING" > "$STATUS_TXT"
 }
 
 start_briar
 decide_state_window
 
-# Main loop:
-# - handle reset
-# - keep Briar running
-# - if in PAIRING, keep QR + URL updated
 while true; do
   if consume_reset_request; then
     log "RESET: requested"
@@ -346,19 +399,17 @@ while true; do
     decide_state_window
   fi
 
-  # If Briar died, restart and re-decide
   if ! kill -0 "$BriarPID" 2>/dev/null; then
-    log "Briar exited; restarting"
+    echo "ERROR" > "$STATUS_TXT"
+    sleep 2
     start_briar
     decide_state_window
   fi
 
-  # If pairing, keep extracting so refresh shows latest
   if grep -q "^PAIRING" "$STATUS_TXT"; then
     update_pairing_url
     extract_ascii_qr
 
-    # If prompts disappear and tor is fully up, flip to connected after ~10s stable
     stable=0
     for _ in $(seq 1 10); do
       if ! kill -0 "$BriarPID" 2>/dev/null; then

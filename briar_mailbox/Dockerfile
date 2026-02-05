@@ -21,11 +21,15 @@ RUN git clone --depth=1 https://code.briarproject.org/briar/briar-mailbox.git . 
 # -------------------------
 FROM ${BUILD_FROM}
 
-# Only install small basics from Debian
+# Install necessary tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash ca-certificates \
+    openjdk-21-jre-headless \
+    python3 python3-pip \
+  && pip3 install --no-cache-dir qrcode[pil] pillow \
   && update-ca-certificates \
   && rm -rf /var/lib/apt/lists/*
+
 
 # Copy a known-good Java 17 runtime from the builder
 COPY --from=builder /opt/java/openjdk /opt/java/openjdk

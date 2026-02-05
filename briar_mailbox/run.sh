@@ -18,10 +18,11 @@ export XDG_CONFIG_HOME=/data/.config
 export XDG_CACHE_HOME=/data/.cache
 mkdir -p /data/.local/share /data/.config /data/.cache
 
-# Write placeholders so the web UI works immediately
+# Write placeholder files so UI works immediately
 echo "" > "$QR_TXT"
+rm -f "$QR_PNG" || true
 
-# Create a tiny HTML page in /data (served by the same web server)
+# Create HTML page (IMPORTANT: RELATIVE paths for HA ingress)
 cat > "$INDEX" <<'HTML'
 <!doctype html>
 <html>
@@ -40,19 +41,36 @@ cat > "$INDEX" <<'HTML'
 <body>
   <div class="wrap">
     <h2>Briar Mailbox</h2>
-    <p class="muted">If the QR is blank, refresh after the mailbox finishes starting.</p>
-    <p><img src="/qr.png" alt="QR (will appear when ready)"/></p>
+    <p class="muted">If the QR is blank, wait a bit or refresh. This page updates automatically every 2 seconds.</p>
+
+    <h3>QR (will appear when ready)</h3>
+    <!-- RELATIVE path: ingress-safe -->
+    <p><img id="qr" src="qr.png?ts=0" alt="QR"/></p>
+
     <h3>Copy/paste link</h3>
     <code id="link">(waiting for mailbox link...)</code>
+
     <script>
       async function refresh() {
         try {
-          const t = (await (await fetch('/mailbox.txt', {cache:'no-store'})).text()).trim();
-          document.getElementById('link').textContent = t || '(waiting for mailbox link...)';
+          // RELATIVE path: ingress-safe
+          const resp = await fetch('mailbox.txt', { cache: 'no-store' });
+          if (!resp.ok) throw new Error(String(resp.status));
+          const t = (await resp.text()).trim();
+
+          document.getElementById('link').textContent =
+            t || '(waiting for mailbox link...)';
+
+          // Cache-bust the QR so it appears as soon as generated
+          if (t) {
+            document.getElementById('qr').src = 'qr.png?ts=' + Date.now();
+          }
         } catch (e) {
-          document.getElementById('link').textContent = '(could not load mailbox.txt)';
+          document.getElementById('link').textContent =
+            '(could not load mailbox.txt: ' + (e && e.message ? e.message : e) + ')';
         }
       }
+
       refresh();
       setInterval(refresh, 2000);
     </script>
@@ -68,6 +86,7 @@ import os
 
 class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
+        # Serve index.html at "/"
         if self.path == "/":
             self.path = "/index.html"
         return super().do_GET()
@@ -76,14 +95,11 @@ os.chdir("/data")
 HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
 PY
 
-/opt/venv/bin/python /tmp/server.py >/tmp/http.log 2>&1 &
+/opt/venv/bin/python /tmp/server.py >"$HTTP_LOG" 2>&1 &
 WebPID=$!
-echo "Ingress web server started (pid=$WebPID)"
-
-echo "HTTP server started on :8080 (pid=$WebPID). Logs: $HTTP_LOG"
+echo "Ingress web server started (pid=$WebPID). Logs: $HTTP_LOG"
 
 # Start Briar mailbox and tee output to a log
-# IMPORTANT: process substitution keeps $! as the JAVA PID (not tee)
 echo "Starting Briar mailbox..."
 java -jar /app/briar-mailbox.jar > >(tee -a "$LOG") 2>&1 &
 BriarPID=$!
@@ -129,9 +145,12 @@ if txt:
     img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
     img.save("/data/qr.png")
 else:
-    # create a small placeholder
     Image.new("RGB", (600, 600), "white").save("/data/qr.png")
 PY
+
+  # Helpful debug (shows files exist)
+  ls -la /data || true
+  ls -la /data/mailbox.txt /data/qr.png || true
 fi
 
 # Keep container alive as long as Briar is alive

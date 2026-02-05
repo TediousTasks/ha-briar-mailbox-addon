@@ -62,9 +62,24 @@ cat > "$INDEX" <<'HTML'
 HTML
 
 # Start web server FIRST so HA ingress can connect immediately
-cd "$DATA_DIR"
-/opt/venv/bin/python -m http.server 8080 --bind 0.0.0.0 > "$HTTP_LOG" 2>&1 &
+cat > /tmp/server.py <<'PY'
+from http.server import SimpleHTTPRequestHandler, HTTPServer
+import os
+
+class Handler(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/":
+            self.path = "/index.html"
+        return super().do_GET()
+
+os.chdir("/data")
+HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+PY
+
+/opt/venv/bin/python /tmp/server.py >/tmp/http.log 2>&1 &
 WebPID=$!
+echo "Ingress web server started (pid=$WebPID)"
+
 echo "HTTP server started on :8080 (pid=$WebPID). Logs: $HTTP_LOG"
 
 # Start Briar mailbox and tee output to a log

@@ -59,12 +59,11 @@ cat > "$INDEX" <<'HTML'
     <h3>Desktop link</h3>
     <code id="link">(waiting...)</code>
 
-    <h3>Captured ASCII (for debugging)</h3>
+    <h3>Captured ASCII (debug)</h3>
     <pre id="ascii">(waiting...)</pre>
 
     <script>
       async function refresh() {
-        // update link
         try {
           const t = (await (await fetch('mailbox.txt', { cache: 'no-store' })).text()).trim();
           document.getElementById('link').textContent = t || '(waiting...)';
@@ -72,7 +71,6 @@ cat > "$INDEX" <<'HTML'
           document.getElementById('link').textContent = '(error loading mailbox.txt)';
         }
 
-        // update ascii
         try {
           const a = await (await fetch('qr_ascii.txt', { cache: 'no-store' })).text();
           document.getElementById('ascii').textContent = a.trim() ? a : '(waiting...)';
@@ -80,7 +78,6 @@ cat > "$INDEX" <<'HTML'
           document.getElementById('ascii').textContent = '(error loading qr_ascii.txt)';
         }
 
-        // bust cache for QR image
         document.getElementById('qrimg').src = 'qr.png?t=' + Date.now();
       }
       refresh();
@@ -115,49 +112,46 @@ java -jar /app/briar-mailbox.jar 2>&1 | tee -a "$LOG" &
 BriarPID=$!
 
 extract_ascii_qr() {
-  # Extract ONLY the QR block from log into /data/qr_ascii.txt
-  # Between:
-  #   Please scan this with the Briar Android app:
-  # and
-  #   Or copy and paste this into Briar Desktop:
+  # Use "inside" not "in" (reserved on some awk)
   awk '
-    BEGIN {in=0}
-    /Please scan this with the Briar Android app:/ {in=1; next}
-    /Or copy and paste this into Briar Desktop:/ {in=0}
-    in==1 {print}
-  ' "$LOG" > "$QR_ASCII"
+    BEGIN {inside=0}
+    /Please scan this with the Briar Android app:/ {inside=1; next}
+    /Or copy and paste this into Briar Desktop:/ {inside=0}
+    inside==1 {print}
+  ' "$LOG" > "$QR_ASCII" || true
 
-  # Remove totally empty leading/trailing lines
-  # (keeps the QR grid intact)
-  sed -i '1{/^$/d;}' "$QR_ASCII" 2>/dev/null || true
+  # Trim only leading/trailing blank lines (don’t touch internal spacing)
+  python - <<'PY'
+from pathlib import Path
+p = Path("/data/qr_ascii.txt")
+lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+# strip leading/trailing empties
+while lines and not lines[0].strip():
+    lines.pop(0)
+while lines and not lines[-1].strip():
+    lines.pop()
+p.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+PY
 }
 
 render_ascii_qr_to_png() {
-  /opt/venv/bin/python - <<'PY'
+  python - <<'PY'
 from pathlib import Path
 from PIL import Image
 
-p = Path("/data/qr_ascii.txt")
-txt = p.read_text(encoding="utf-8", errors="ignore").splitlines()
-
-# keep only lines that look like QR rows (contain block chars)
-# Briar uses full block █. If anything non-space is present, treat as black.
-rows = [r.rstrip("\n") for r in txt if r.strip()]
+rows = Path("/data/qr_ascii.txt").read_text(encoding="utf-8", errors="ignore").splitlines()
+rows = [r.rstrip("\n") for r in rows if r.strip()]
 
 if not rows:
     Image.new("RGB", (600, 600), "white").save("/data/qr.png")
     raise SystemExit(0)
 
-# Normalize widths
 w = max(len(r) for r in rows)
 rows = [r.ljust(w, " ") for r in rows]
 h = len(rows)
 
-# Scale: pixels per module
-scale = 10
-
-# Add quiet zone border (modules)
-border = 4
+scale = 12      # make it big enough to scan even via ingress
+border = 5      # quiet zone
 
 img_w = (w + border*2) * scale
 img_h = (h + border*2) * scale
@@ -166,7 +160,7 @@ img = Image.new("RGB", (img_w, img_h), "white")
 px = img.load()
 
 def is_black(ch: str) -> bool:
-    # Briar prints "█" but be tolerant: anything non-space counts as black
+    # Briar prints █, but treat any non-space as black to be robust
     return ch != " "
 
 for y, row in enumerate(rows):
@@ -193,16 +187,15 @@ for i in $(seq 1 240); do
     break
   fi
 
-  # Extract desktop URL if present
+  # Desktop URL (not used for Android QR, but still useful to display)
   MAILBOX_URL="$(grep -Eo 'briar-mailbox://[^[:space:]]+' "$LOG" | tail -n 1 || true)"
   if [[ -n "$MAILBOX_URL" ]]; then
     echo "$MAILBOX_URL" > "$QR_TXT"
   fi
 
-  # Extract ASCII QR
   extract_ascii_qr
 
-  # If we have a real-looking QR block (many lines), render it
+  # If we have a real-looking QR block, render it
   if [[ "$(wc -l < "$QR_ASCII" | tr -d ' ')" -ge 20 ]]; then
     render_ascii_qr_to_png
     FOUND_QR="yes"
@@ -217,5 +210,4 @@ for i in $(seq 1 240); do
 done
 
 echo "Mailbox URL captured: $(cat "$QR_TXT" 2>/dev/null || true)"
-
 wait "$BriarPID"

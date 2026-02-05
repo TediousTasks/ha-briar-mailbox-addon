@@ -15,16 +15,9 @@ WORKDIR /build
 
 RUN git clone --depth=1 https://code.briarproject.org/briar/briar-mailbox.git . \
   && ./gradlew --no-daemon x86LinuxJar \
-  && echo "=== JARs produced (debug) ===" \
-  && find . -maxdepth 8 -type f -name "*.jar" -print \
-  && JAR_PATH="$(find . -maxdepth 10 -type f -name '*x86_64*.jar' | head -n 1)" \
-  && if [ -z "$JAR_PATH" ]; then \
-       echo "ERROR: Could not find a '*x86_64*.jar' produced by Gradle."; \
-       echo "Above is the jar list found. Adjust the find pattern if needed."; \
-       exit 1; \
-     fi \
+  && test -f mailbox-cli/build/libs/mailbox-cli-linux-x86_64.jar \
   && mkdir -p /out \
-  && cp "$JAR_PATH" /out/briar-mailbox.jar
+  && cp mailbox-cli/build/libs/mailbox-cli-linux-x86_64.jar /out/briar-mailbox.jar
 
 # -------- Runtime stage --------
 FROM ${BUILD_FROM}

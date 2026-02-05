@@ -161,9 +161,14 @@ tor_bootstrapped() {
 }
 
 tor_progress_pct() {
-  # returns an integer 0-100, best effort
+  # IMPORTANT: must never fail under `set -euo pipefail`
   local pct=""
-  pct="$(grep -Eo 'Bootstrapped [0-9]{1,3}% ' "$LOG" | tail -n 1 | grep -Eo '[0-9]{1,3}' || true)"
+  pct="$(
+    grep -Eo 'Bootstrapped [0-9]{1,3}% ' "$LOG" 2>/dev/null \
+      | tail -n 1 \
+      | grep -Eo '[0-9]{1,3}' \
+      || true
+  )"
   if [[ -z "$pct" ]]; then
     echo 0
   else
@@ -354,7 +359,6 @@ start_briar() {
 }
 
 decide_state_window() {
-  # up to ~90 seconds to reach either PAIRING (after tor >=10%) or CONNECTED
   for _ in $(seq 1 90); do
     if ! kill -0 "$BriarPID" 2>/dev/null; then
       echo "ERROR" > "$STATUS_TXT"
@@ -373,7 +377,6 @@ decide_state_window() {
       return 0
     fi
 
-    # If Tor is progressing (>=10%), we should present as PAIRING even if prompt hasn't printed yet
     pct="$(tor_progress_pct)"
     if [[ "$pct" -ge 10 ]]; then
       echo "PAIRING" > "$STATUS_TXT"
@@ -407,12 +410,10 @@ while true; do
     decide_state_window
   fi
 
-  # While pairing, keep updating artifacts so Refresh shows current data
   if grep -q "^PAIRING" "$STATUS_TXT"; then
     update_pairing_url
     extract_ascii_qr
 
-    # Flip to CONNECTED after stable 100% + no pairing prompt
     stable=0
     for _ in $(seq 1 10); do
       if ! kill -0 "$BriarPID" 2>/dev/null; then

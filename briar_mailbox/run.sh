@@ -26,9 +26,7 @@ mkdir -p /data/.local/share /data/.config /data/.cache
 : > "$QR_TXT"
 echo "STARTING" > "$STATUS_TXT"
 
-log() {
-  echo "[$(date -Is)] $*" >&2
-}
+log() { echo "[$(date -Is)] $*" >&2; }
 
 consume_reset_request() {
   [[ -f "$RESET_FLAG" ]] || return 1
@@ -47,98 +45,80 @@ fix_data_permissions() {
   chmod -R u+rwX /data/.local 2>/dev/null || true
 }
 
-# Kill any orphaned tor/proxy processes that might survive Java exit
 kill_orphan_tor() {
-  # Only within this container; keep it targeted.
-  # onionwrapper installs tor binaries under /data, so matching /data.*tor is safe.
   local patterns=(
     "/data/.*/tor"
     "/data/.*/obfs4proxy"
     "/data/.*/snowflake"
     "obfs4proxy"
     "snowflake"
+    " tor "
   )
 
-  local killed_any="no"
+  local killed="no"
   for pat in "${patterns[@]}"; do
-    local pids=""
+    local pids
     pids="$(pgrep -f "$pat" 2>/dev/null || true)"
     if [[ -n "$pids" ]]; then
-      killed_any="yes"
-      log "Cleanup: TERM pids for pattern '$pat': $pids"
+      killed="yes"
+      log "Cleanup: TERM '$pat' pids: $pids"
       kill $pids 2>/dev/null || true
     fi
   done
 
-  # Give them a moment to die cleanly
   sleep 1
 
-  # Hard kill anything still around
   for pat in "${patterns[@]}"; do
-    local pids=""
+    local pids
     pids="$(pgrep -f "$pat" 2>/dev/null || true)"
     if [[ -n "$pids" ]]; then
-      log "Cleanup: KILL pids for pattern '$pat': $pids"
+      log "Cleanup: KILL '$pat' pids: $pids"
       kill -9 $pids 2>/dev/null || true
     fi
   done
 
-  # Ensure ports/locks have time to clear
-  if [[ "$killed_any" == "yes" ]]; then
-    sleep 1
-  fi
+  [[ "$killed" == "yes" ]] && sleep 1
 }
 
 stop_briar_hard() {
   local pid="${1:-}"
   [[ -n "$pid" ]] || return 0
 
-  if ! kill -0 "$pid" 2>/dev/null; then
-    return 0
-  fi
-
-  log "Stop: SIGTERM $pid"
-  kill "$pid" 2>/dev/null || true
-
-  for _ in $(seq 1 12); do
-    if ! kill -0 "$pid" 2>/dev/null; then
-      break
-    fi
-    sleep 0.5
-  done
-
   if kill -0 "$pid" 2>/dev/null; then
-    log "Stop: SIGKILL $pid"
-    kill -9 "$pid" 2>/dev/null || true
-    sleep 0.5
+    log "Stop: SIGTERM $pid"
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 12); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      log "Stop: SIGKILL $pid"
+      kill -9 "$pid" 2>/dev/null || true
+      sleep 0.5
+    fi
   fi
 
-  # Critical: clean up tor/proxy processes that may outlive Java
   kill_orphan_tor
 }
 
 wipe_data_dir_preserve_ui() {
   echo "RESETTING" > "$STATUS_TXT"
-
   : > "$LOG"
   : > "$QR_ASCII"
   : > "$QR_TXT"
 
-  # Preserve allowlist: index.html, status.txt, qr_ascii.txt, mailbox.txt
   find /data -mindepth 1 \
     \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/qr_ascii.txt" -o -path "/data/mailbox.txt" \) -prune -o \
     -exec rm -rf {} + || true
 
   mkdir -p /data/.local/share /data/.config /data/.cache
   fix_data_permissions
-
-  # Extra safety: after wipe, make sure nothing tor-like is running
   kill_orphan_tor
 
   echo "STARTING" > "$STATUS_TXT"
 }
 
-# --- State detection from log ---
+# --- Log parsing / state ---
 extract_ascii_qr() {
   awk '
     BEGIN {inside=0}
@@ -180,7 +160,18 @@ tor_bootstrapped() {
   grep -q "Bootstrapped 100% (done): Done" "$LOG"
 }
 
-# --- Clean UI ---
+tor_progress_pct() {
+  # returns an integer 0-100, best effort
+  local pct=""
+  pct="$(grep -Eo 'Bootstrapped [0-9]{1,3}% ' "$LOG" | tail -n 1 | grep -Eo '[0-9]{1,3}' || true)"
+  if [[ -z "$pct" ]]; then
+    echo 0
+  else
+    echo "$pct"
+  fi
+}
+
+# --- Clean UI page ---
 cat > "$INDEX" <<'HTML'
 <!doctype html>
 <html>
@@ -363,7 +354,8 @@ start_briar() {
 }
 
 decide_state_window() {
-  for _ in $(seq 1 60); do
+  # up to ~90 seconds to reach either PAIRING (after tor >=10%) or CONNECTED
+  for _ in $(seq 1 90); do
     if ! kill -0 "$BriarPID" 2>/dev/null; then
       echo "ERROR" > "$STATUS_TXT"
       return 0
@@ -378,6 +370,15 @@ decide_state_window() {
 
     if tor_bootstrapped; then
       echo "CONNECTED" > "$STATUS_TXT"
+      return 0
+    fi
+
+    # If Tor is progressing (>=10%), we should present as PAIRING even if prompt hasn't printed yet
+    pct="$(tor_progress_pct)"
+    if [[ "$pct" -ge 10 ]]; then
+      echo "PAIRING" > "$STATUS_TXT"
+      update_pairing_url
+      extract_ascii_qr
       return 0
     fi
 
@@ -406,17 +407,19 @@ while true; do
     decide_state_window
   fi
 
+  # While pairing, keep updating artifacts so Refresh shows current data
   if grep -q "^PAIRING" "$STATUS_TXT"; then
     update_pairing_url
     extract_ascii_qr
 
+    # Flip to CONNECTED after stable 100% + no pairing prompt
     stable=0
     for _ in $(seq 1 10); do
       if ! kill -0 "$BriarPID" 2>/dev/null; then
         stable=0
         break
       fi
-      if ! saw_pairing_prompt && tor_bootstrapped; then
+      if tor_bootstrapped && ! saw_pairing_prompt; then
         stable=$((stable + 1))
       else
         stable=0

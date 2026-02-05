@@ -16,10 +16,10 @@ mkdir -p "$DATA_DIR"
 
 log() { echo "[$(date -Is)] $*" >&2; }
 
-# If anything errors, we log the line and keep the addon alive
+# Keep container alive if something truly blows up, but show ERROR in UI
 on_err() {
   local rc=$?
-  log "FATAL: error on/near line ${BASH_LINENO[0]} (rc=$rc). Keeping container alive for logs."
+  log "FATAL: error on/near line ${BASH_LINENO[0]} (rc=$rc). Keeping container alive."
   echo "ERROR" > "$STATUS_TXT" 2>/dev/null || true
   while true; do sleep 3600; done
 }
@@ -164,15 +164,15 @@ tor_bootstrapped() {
   grep -q "Bootstrapped 100% (done): Done" "$LOG"
 }
 
-tor_progress_pct() {
-  local pct=""
-  pct="$(
-    grep -Eo 'Bootstrapped [0-9]{1,3}% ' "$LOG" 2>/dev/null \
-      | tail -n 1 \
-      | grep -Eo '[0-9]{1,3}' \
-      || true
-  )"
-  [[ -z "$pct" ]] && echo 0 || echo "$pct"
+write_status() {
+  local s="$1"
+  # Avoid noisy rewrites unless it changed
+  local cur=""
+  cur="$(cat "$STATUS_TXT" 2>/dev/null || true)"
+  if [[ "$cur" != "$s" ]]; then
+    echo "$s" > "$STATUS_TXT"
+    log "UI status => $s"
+  fi
 }
 
 # --- Clean UI page (connected vs pairing) ---
@@ -337,7 +337,6 @@ PY
 
 python /tmp/server.py >"$HTTP_LOG" 2>&1 &
 log "HTTP server started on :8080. Logs: $HTTP_LOG"
-log "Continuing to start Briar (if you do not see this line, your file is not what is running)."
 
 BriarPID=""
 
@@ -345,7 +344,7 @@ start_briar() {
   : > "$LOG"
   : > "$QR_ASCII"
   : > "$QR_TXT"
-  echo "STARTING" > "$STATUS_TXT"
+  write_status "STARTING"
 
   fix_data_permissions
   kill_orphan_tor
@@ -356,41 +355,44 @@ start_briar() {
   log "Briar PID: $BriarPID"
 }
 
-decide_state_window() {
-  for _ in $(seq 1 90); do
-    if ! kill -0 "$BriarPID" 2>/dev/null; then
-      echo "ERROR" > "$STATUS_TXT"
-      return 0
+# Background watcher keeps UI truthful
+watch_state() {
+  while true; do
+    # Briar dead?
+    if [[ -n "${BriarPID:-}" ]] && ! kill -0 "$BriarPID" 2>/dev/null; then
+      write_status "ERROR"
+      sleep 1
+      continue
     fi
 
+    # Pairing signals win if present
     if saw_pairing_prompt; then
-      echo "PAIRING" > "$STATUS_TXT"
+      write_status "PAIRING"
       update_pairing_url
       extract_ascii_qr
-      return 0
+      sleep 2
+      continue
     fi
 
+    # Connected when Tor 100% and no pairing prompts
     if tor_bootstrapped; then
-      echo "CONNECTED" > "$STATUS_TXT"
-      return 0
+      write_status "CONNECTED"
+      # Hide pairing artifacts (defense-in-depth)
+      : > "$QR_ASCII"
+      : > "$QR_TXT"
+      sleep 3
+      continue
     fi
 
-    pct="$(tor_progress_pct)"
-    if [[ "$pct" -ge 10 ]]; then
-      echo "PAIRING" > "$STATUS_TXT"
-      update_pairing_url
-      extract_ascii_qr
-      return 0
-    fi
-
-    sleep 1
+    # Default
+    write_status "STARTING"
+    sleep 2
   done
-
-  echo "STARTING" > "$STATUS_TXT"
 }
 
 start_briar
-decide_state_window
+watch_state &
+WATCH_PID="$!"
 
 while true; do
   if consume_reset_request; then
@@ -398,39 +400,12 @@ while true; do
     stop_briar_hard "$BriarPID"
     wipe_data_dir_preserve_ui
     start_briar
-    decide_state_window
   fi
 
-  if ! kill -0 "$BriarPID" 2>/dev/null; then
-    echo "ERROR" > "$STATUS_TXT"
-    sleep 2
+  # If Briar crashes, restart it and let watcher update status
+  if [[ -n "${BriarPID:-}" ]] && ! kill -0 "$BriarPID" 2>/dev/null; then
+    log "Briar exited; restarting..."
     start_briar
-    decide_state_window
-  fi
-
-  if grep -q "^PAIRING" "$STATUS_TXT"; then
-    update_pairing_url
-    extract_ascii_qr
-
-    stable=0
-    for _ in $(seq 1 10); do
-      if ! kill -0 "$BriarPID" 2>/dev/null; then
-        stable=0
-        break
-      fi
-      if tor_bootstrapped && ! saw_pairing_prompt; then
-        stable=$((stable + 1))
-      else
-        stable=0
-      fi
-      sleep 1
-    done
-
-    if [[ "$stable" -ge 10 ]]; then
-      echo "CONNECTED" > "$STATUS_TXT"
-      : > "$QR_ASCII"
-      : > "$QR_TXT"
-    fi
   fi
 
   sleep 2

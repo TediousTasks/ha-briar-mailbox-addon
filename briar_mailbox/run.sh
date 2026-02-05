@@ -225,7 +225,22 @@ cat > "$INDEX" <<'HTML'
 </head>
 <body>
   <div class="wrap">
-    <h2>Briar Mailbox</h2>
+    <style>
+  .briar-icon {
+    height: 1em;
+    vertical-align: middle;
+    margin-right: 0.4em;
+  }
+</style>
+
+<h2>
+  <img
+    src="https://code.briarproject.org/briar/briar-styleguide/-/raw/master/static/images/briar_icon_color.png"
+    alt="Briar icon"
+    class="briar-icon"
+  />
+  Briar Mailbox
+</h2>
     <p class="muted">Click Refresh to update the pairing view.</p>
 
     <div class="card">

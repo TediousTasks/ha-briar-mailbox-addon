@@ -1,6 +1,7 @@
 name: "Briar Mailbox"
 slug: "briar_mailbox"
-version: "0.2.38"
+icon: icon.png
+version: "0.2.40"
 description: "Briar Mailbox Server CLI packaged as a Home Assistant App (add-on)."
 url: "https://code.briarproject.org/briar/briar-mailbox"
 

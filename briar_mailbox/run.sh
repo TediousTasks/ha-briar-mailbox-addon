@@ -13,6 +13,11 @@ QR_TXT="${DATA_DIR}/mailbox.txt"
 RESET_FLAG="${DATA_DIR}/reset"
 BOOT_MARK="${DATA_DIR}/boot_ts"
 
+# FIFO logging (fixes pipeline PID problem)
+FIFO="/tmp/briar_fifo"
+TEEPID=""
+BriarPID=""
+
 mkdir -p "$DATA_DIR"
 
 log() { echo "[$(date -Is)] $*" >&2; }
@@ -39,7 +44,6 @@ echo "STARTING" > "$STATUS_TXT"
 
 # Boot marker so we ignore stale reset flags from previous runs
 date -Is > "$BOOT_MARK"
-# Extra safety: remove stale reset file at boot
 rm -f "$RESET_FLAG" 2>/dev/null || true
 
 fix_data_permissions() {
@@ -51,7 +55,6 @@ fix_data_permissions() {
   chmod 755 /data 2>/dev/null || true
   chmod 700 /data/.config /data/.cache 2>/dev/null || true
   chmod -R u+rwX /data/.local 2>/dev/null || true
-  log "Perms: ensured /data owned by ${uid}:${gid} and writable."
 }
 
 kill_orphan_tor() {
@@ -87,14 +90,14 @@ kill_orphan_tor() {
 
 stop_briar_hard() {
   local pid="${1:-}"
-  [[ -n "$pid" ]] || return 0
 
-  if kill -0 "$pid" 2>/dev/null; then
+  # stop java
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
     log "Stop: SIGTERM $pid"
     kill "$pid" 2>/dev/null || true
-    for _ in $(seq 1 12); do
+    for _ in $(seq 1 20); do
       kill -0 "$pid" 2>/dev/null || break
-      sleep 0.5
+      sleep 0.25
     done
     if kill -0 "$pid" 2>/dev/null; then
       log "Stop: SIGKILL $pid"
@@ -102,6 +105,13 @@ stop_briar_hard() {
       sleep 0.5
     fi
   fi
+
+  # stop tee
+  if [[ -n "${TEEPID:-}" ]] && kill -0 "$TEEPID" 2>/dev/null; then
+    kill "$TEEPID" 2>/dev/null || true
+  fi
+
+  rm -f "$FIFO" 2>/dev/null || true
 
   kill_orphan_tor
 }
@@ -132,8 +142,7 @@ extract_ascii_qr() {
     inside==1 {print}
   ' "$LOG" > "$QR_ASCII" 2>/dev/null || true
 
-  # Strip only leading/trailing completely blank lines.
-  # DO NOT trim per-line leading spaces (quiet zone).
+  # strip only blank first/last lines; DO NOT strip leading spaces
   python - <<'PY'
 from pathlib import Path
 p = Path("/data/qr_ascii.txt")
@@ -165,6 +174,11 @@ tor_bootstrapped() {
   grep -q "Bootstrapped 100% (done): Done" "$LOG"
 }
 
+# key: treat unlink/stop as "PAIRING transition"
+tor_exited_cleanly() {
+  grep -q "Tor exited with value 0" "$LOG"
+}
+
 write_status() {
   local s="$1"
   local cur=""
@@ -175,7 +189,6 @@ write_status() {
   fi
 }
 
-# Only consume reset if it was created AFTER this boot marker
 consume_reset_request() {
   [[ -f "$RESET_FLAG" ]] || return 1
   if [[ "$RESET_FLAG" -ot "$BOOT_MARK" ]]; then
@@ -252,14 +265,13 @@ cat > "$INDEX" <<'HTML'
         if (!confirm("Reset now? This wipes /data and requires pairing again.")) e.preventDefault();
       });
 
-      // Trim helper for things like mailbox URL
       async function loadTextTrim(path) {
         const r = await fetch(path, { cache: 'no-store' });
         if (!r.ok) throw new Error(path + " " + r.status);
         return (await r.text()).trim();
       }
 
-      // RAW loader: do NOT trim, preserves leading spaces (quiet zone) so QR stays aligned
+      // RAW loader: do NOT trim; preserves leading spaces on line 1 (quiet zone)
       async function loadTextRaw(path) {
         const r = await fetch(path, { cache: 'no-store' });
         if (!r.ok) throw new Error(path + " " + r.status);
@@ -297,9 +309,9 @@ cat > "$INDEX" <<'HTML'
           tag.textContent = "PAIRING";
           show("pairing");
 
-          // ASCII must be RAW to preserve left padding on line 1
           try {
             const raw = await loadTextRaw("qr_ascii.txt");
+            // keep leading spaces; just strip trailing whitespace at the end of the whole file
             document.getElementById("ascii").textContent = raw && raw.trim().length ? raw.replace(/\s+$/,"") : "(waiting...)";
           } catch {
             document.getElementById("ascii").textContent = "(error loading qr_ascii.txt)";
@@ -361,8 +373,6 @@ PY
 python /tmp/server.py >"$HTTP_LOG" 2>&1 &
 log "HTTP server started on :8080. Logs: $HTTP_LOG"
 
-BriarPID=""
-
 start_briar() {
   : > "$LOG"
   : > "$QR_ASCII"
@@ -372,20 +382,31 @@ start_briar() {
   fix_data_permissions
   kill_orphan_tor
 
+  rm -f "$FIFO" 2>/dev/null || true
+  mkfifo "$FIFO"
+
+  # Tee reads FIFO and writes to LOG + container stdout
+  tee -a "$LOG" < "$FIFO" &
+  TEEPID="$!"
+
   log "Starting Briar mailbox..."
-  java -jar /app/briar-mailbox.jar 2>&1 | tee -a "$LOG" &
+  # Java writes to FIFO; we keep Java PID (critical)
+  java -jar /app/briar-mailbox.jar > "$FIFO" 2>&1 &
   BriarPID="$!"
   log "Briar PID: $BriarPID"
 }
 
+cleanup_fifo() {
+  # Close FIFO reader/writer cleanly
+  if [[ -n "${TEEPID:-}" ]] && kill -0 "$TEEPID" 2>/dev/null; then
+    kill "$TEEPID" 2>/dev/null || true
+  fi
+  rm -f "$FIFO" 2>/dev/null || true
+}
+
 watch_state() {
   while true; do
-    if [[ -n "${BriarPID:-}" ]] && ! kill -0 "$BriarPID" 2>/dev/null; then
-      write_status "ERROR"
-      sleep 1
-      continue
-    fi
-
+    # Pairing prompt has priority
     if saw_pairing_prompt; then
       write_status "PAIRING"
       update_pairing_url
@@ -394,11 +415,19 @@ watch_state() {
       continue
     fi
 
+    # Connected detection
     if tor_bootstrapped; then
       write_status "CONNECTED"
       : > "$QR_ASCII"
       : > "$QR_TXT"
       sleep 3
+      continue
+    fi
+
+    # If tor exited cleanly (unlink), do NOT show error; treat as starting/pairing transition
+    if tor_exited_cleanly; then
+      write_status "STARTING"
+      sleep 2
       continue
     fi
 
@@ -410,16 +439,52 @@ watch_state() {
 start_briar
 watch_state &
 
+# Restart/backoff controls
+FAIL_COUNT=0
+FAIL_WINDOW_START="$(date +%s)"
+
 while true; do
   if consume_reset_request; then
     log "RESET: requested"
     stop_briar_hard "$BriarPID"
     wipe_data_dir_preserve_ui
     start_briar
+    FAIL_COUNT=0
+    FAIL_WINDOW_START="$(date +%s)"
   fi
 
+  # If Briar stopped, decide whether it's unlink->pairing or real error
   if [[ -n "${BriarPID:-}" ]] && ! kill -0 "$BriarPID" 2>/dev/null; then
-    log "Briar exited; restarting..."
+    # ensure FIFO tee doesn't keep things weird
+    cleanup_fifo
+
+    # If we saw Tor exited 0, treat as "go back to pairing"
+    if tor_exited_cleanly; then
+      log "Briar exited after Tor clean exit; treating as PAIRING transition (not error). Restarting..."
+      write_status "STARTING"
+      FAIL_COUNT=0
+      FAIL_WINDOW_START="$(date +%s)"
+      start_briar
+      sleep 1
+      continue
+    fi
+
+    # Otherwise: restart, but mark ERROR if it keeps failing
+    local_now="$(date +%s)"
+    if (( local_now - FAIL_WINDOW_START > 120 )); then
+      FAIL_WINDOW_START="$local_now"
+      FAIL_COUNT=0
+    fi
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+
+    log "Briar exited unexpectedly; restarting... (fail count in 2m window: $FAIL_COUNT)"
+    if (( FAIL_COUNT >= 3 )); then
+      write_status "ERROR"
+    else
+      write_status "STARTING"
+    fi
+
+    stop_briar_hard "$BriarPID" || true
     start_briar
   fi
 

@@ -5,7 +5,11 @@
 # - Persistent connected flag (/data/connected)
 # - Reset button (POST /reset) that wipes Briar state + restarts Briar
 # - Log tail visible in UI (/data/briar_tail.txt)
-
+#
+# IMPORTANT FIX:
+# Your previous script *did* start Briar, but you never saw "Starting Briar mailbox..."
+# because it was printed inside a command-substitution (BriarPID="$(start_briar)"),
+# which captures stdout. This version logs to STDERR and does NOT use command-substitution.
 
 set -uo pipefail
 
@@ -38,7 +42,8 @@ export XDG_CACHE_HOME=/data/.cache
 : > "$BRIAR_TAIL"
 echo "STARTING" > "$STATUS_TXT"
 
-log() { echo "[$(date -Is)] $*"; }
+# Log to STDERR so it always shows in HA logs even when stdout is captured anywhere
+log() { echo "[$(date -Is)] $*" >&2; }
 
 update_briar_tail() {
   tail -n 200 "$LOG" > "$BRIAR_TAIL" 2>/dev/null || true
@@ -276,13 +281,23 @@ tor_bootstrapped() {
   grep -q "Bootstrapped 100% (done): Done" "$LOG" 2>/dev/null
 }
 
+# Start Briar and set global BriarPID (no stdout capture tricks)
+BriarPID=""
+
 start_briar() {
   : > "$LOG"
   update_briar_tail
   log "Starting Briar mailbox..."
   echo "STARTING (launching Briar)" > "$STATUS_TXT"
+
+  # If java/jar is broken, we want to SEE it and not exit the whole script.
+  set +e
   java -jar /app/briar-mailbox.jar 2>&1 | tee -a "$LOG" &
-  echo $!
+  BriarPID="$!"
+  set -e
+
+  log "Briar PID: $BriarPID"
+  update_briar_tail
 }
 
 # --- Main supervisor loop (keeps script alive in foreground) ---
@@ -294,7 +309,7 @@ while true; do
     echo "STARTING" > "$STATUS_TXT"
   fi
 
-  BriarPID="$(start_briar)"
+  start_briar
 
   # Decide CONNECTED vs PAIRING within 60s, while honoring RESET at any time.
   decided="no"
@@ -379,7 +394,7 @@ while true; do
       sleep 1
     done
 
-    # If reset happened in pairing loop, restart outer loop
+    # If we reset in pairing, restart outer loop
     if [[ -f "$RESET_FLAG" ]]; then
       rm -f "$RESET_FLAG" 2>/dev/null || true
       sleep 1

@@ -1,16 +1,4 @@
 #!/usr/bin/with-contenv bash
-# HA add-on run script with:
-# - Ingress UI on :8080 serving /data
-# - PAIRING vs CONNECTED detection
-# - Persistent connected flag (/data/connected)
-# - Reset button (POST /reset) that wipes Briar state + restarts Briar
-# - Log tail visible in UI (/data/briar_tail.txt)
-#
-# IMPORTANT FIX:
-# Your previous script *did* start Briar, but you never saw "Starting Briar mailbox..."
-# because it was printed inside a command-substitution (BriarPID="$(start_briar)"),
-# which captures stdout. This version logs to STDERR and does NOT use command-substitution.
-
 set -uo pipefail
 
 DATA_DIR="/data"
@@ -35,14 +23,12 @@ export XDG_DATA_HOME=/data/.local/share
 export XDG_CONFIG_HOME=/data/.config
 export XDG_CACHE_HOME=/data/.cache
 
-# Ensure files exist
 : > "$LOG"
 : > "$QR_TXT"
 : > "$QR_ASCII"
 : > "$BRIAR_TAIL"
 echo "STARTING" > "$STATUS_TXT"
 
-# Log to STDERR so it always shows in HA logs even when stdout is captured anywhere
 log() { echo "[$(date -Is)] $*" >&2; }
 
 update_briar_tail() {
@@ -63,6 +49,31 @@ mark_pairing() {
   update_briar_tail
 }
 
+# One-shot claim of reset request:
+# - If file exists, read timestamp, delete it immediately so we can't loop forever.
+# - Ignore stale requests (>120 seconds old).
+consume_reset_request() {
+  [[ -f "$RESET_FLAG" ]] || return 1
+
+  local ts age now
+  ts="$(head -n 1 "$RESET_FLAG" 2>/dev/null || true)"
+  now="$(date +%s)"
+
+  # Delete immediately to prevent infinite reset loops on restart
+  rm -f "$RESET_FLAG" 2>/dev/null || true
+
+  # If ts isn't numeric, treat as "fresh enough"
+  if [[ "$ts" =~ ^[0-9]+$ ]]; then
+    age=$((now - ts))
+    if (( age > 120 )); then
+      log "Ignoring stale reset request (age ${age}s)."
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
 do_reset_now() {
   log "RESET requested — wiping Briar state to force re-pairing..."
   echo "RESETTING" > "$STATUS_TXT"
@@ -71,17 +82,14 @@ do_reset_now() {
   : > "$QR_TXT"
   : > "$QR_ASCII"
 
-  # Wipe Briar state (because HOME/XDG_* point to /data)
   rm -rf /data/.local/share/* /data/.config/* /data/.cache/* 2>/dev/null || true
-
-  rm -f "$RESET_FLAG" 2>/dev/null || true
 
   : > "$LOG"
   update_briar_tail
   log "RESET complete."
 }
 
-# --- Generate UI (relative paths only for ingress) ---
+# --- UI ---
 cat > "$INDEX" <<'HTML'
 <!doctype html>
 <html>
@@ -200,10 +208,10 @@ cat > "$INDEX" <<'HTML'
 </html>
 HTML
 
-# --- Python web server: serves /data + POST /reset creates /data/reset ---
+# --- web server with /reset writing epoch seconds ---
 cat > /tmp/server.py <<'PY'
 from http.server import SimpleHTTPRequestHandler, HTTPServer
-import os
+import os, time
 
 DATA_DIR = "/data"
 RESET_FLAG = os.path.join(DATA_DIR, "reset")
@@ -218,7 +226,7 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path.rstrip("/") == "/reset":
             try:
                 with open(RESET_FLAG, "w", encoding="utf-8") as f:
-                    f.write("reset\n")
+                    f.write(str(int(time.time())) + "\n")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.end_headers()
@@ -281,7 +289,6 @@ tor_bootstrapped() {
   grep -q "Bootstrapped 100% (done): Done" "$LOG" 2>/dev/null
 }
 
-# Start Briar and set global BriarPID (no stdout capture tricks)
 BriarPID=""
 
 start_briar() {
@@ -290,7 +297,6 @@ start_briar() {
   log "Starting Briar mailbox..."
   echo "STARTING (launching Briar)" > "$STATUS_TXT"
 
-  # If java/jar is broken, we want to SEE it and not exit the whole script.
   set +e
   java -jar /app/briar-mailbox.jar 2>&1 | tee -a "$LOG" &
   BriarPID="$!"
@@ -300,9 +306,10 @@ start_briar() {
   update_briar_tail
 }
 
-# --- Main supervisor loop (keeps script alive in foreground) ---
+# If a stale reset flag exists from a previous run, consume/ignore it now
+consume_reset_request >/dev/null 2>&1 || true
+
 while true; do
-  # Make initial state visible quickly
   if [[ -f "$CONNECTED_FLAG" ]]; then
     echo "CONNECTED (flag)" > "$STATUS_TXT"
   else
@@ -311,11 +318,11 @@ while true; do
 
   start_briar
 
-  # Decide CONNECTED vs PAIRING within 60s, while honoring RESET at any time.
+  # Decide CONNECTED vs PAIRING within 60s
   decided="no"
   for _ in $(seq 1 60); do
-    if [[ -f "$RESET_FLAG" ]]; then
-      log "Reset flag detected during startup window."
+    if consume_reset_request; then
+      log "Reset request consumed during startup window."
       kill "$BriarPID" 2>/dev/null || true
       wait "$BriarPID" 2>/dev/null || true
       do_reset_now
@@ -350,24 +357,21 @@ while true; do
     sleep 1
   done
 
-  # If reset happened, restart outer loop
   if [[ "$decided" == "reset" ]]; then
     sleep 1
     continue
   fi
-
-  # If Briar died, restart outer loop
   if [[ "$decided" == "dead" ]]; then
     sleep 2
     continue
   fi
 
-  # If in PAIRING, keep updating until CONNECTED (or reset) or Briar exits
+  # Pairing loop
   if grep -q "^PAIRING" "$STATUS_TXT" 2>/dev/null; then
     stable_connected=0
     while kill -0 "$BriarPID" 2>/dev/null; do
-      if [[ -f "$RESET_FLAG" ]]; then
-        log "Reset flag detected during pairing."
+      if consume_reset_request; then
+        log "Reset request consumed during pairing."
         kill "$BriarPID" 2>/dev/null || true
         wait "$BriarPID" 2>/dev/null || true
         do_reset_now
@@ -394,18 +398,14 @@ while true; do
       sleep 1
     done
 
-    # If we reset in pairing, restart outer loop
-    if [[ -f "$RESET_FLAG" ]]; then
-      rm -f "$RESET_FLAG" 2>/dev/null || true
-      sleep 1
-      continue
-    fi
+    sleep 1
+    continue
   fi
 
-  # Steady-state: keep Briar alive, allow reset, update log tail
+  # Steady-state loop
   while true; do
-    if [[ -f "$RESET_FLAG" ]]; then
-      log "Reset flag detected during steady-state."
+    if consume_reset_request; then
+      log "Reset request consumed during steady-state."
       kill "$BriarPID" 2>/dev/null || true
       wait "$BriarPID" 2>/dev/null || true
       do_reset_now

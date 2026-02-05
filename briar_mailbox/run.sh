@@ -21,7 +21,6 @@ export HOME=/data
 export XDG_DATA_HOME=/data/.local/share
 export XDG_CONFIG_HOME=/data/.config
 export XDG_CACHE_HOME=/data/.cache
-
 mkdir -p /data/.local/share /data/.config /data/.cache
 
 : > "$LOG"
@@ -35,7 +34,7 @@ log() {
 }
 
 update_briar_tail() {
-  tail -n 250 "$LOG" > "$BRIAR_TAIL" 2>/dev/null || true
+  tail -n 300 "$LOG" > "$BRIAR_TAIL" 2>/dev/null || true
 }
 
 consume_reset_request() {
@@ -50,13 +49,13 @@ dump_data_tree_to_control() {
     echo "whoami=$(whoami 2>/dev/null || true) uid=$(id -u) gid=$(id -g)"
     ls -la /data || true
     echo
-    find /data -maxdepth 3 -print 2>/dev/null || true
+    find /data -maxdepth 4 -print 2>/dev/null || true
     echo "-----------------------------------"
   } >> "$CONTROL_LOG"
 }
 
 stop_briar_hard() {
-  local pid="$1"
+  local pid="${1:-}"
   [[ -n "$pid" ]] || return 0
 
   if ! kill -0 "$pid" 2>/dev/null; then
@@ -94,10 +93,8 @@ fix_data_permissions() {
   uid="$(id -u)"
   gid="$(id -g)"
 
-  # Make sure base dirs exist
   mkdir -p /data/.local/share /data/.config /data/.cache
 
-  # Ensure writable for the running user
   chown -R "${uid}:${gid}" /data 2>/dev/null || true
 
   chmod 755 /data 2>/dev/null || true
@@ -105,15 +102,6 @@ fix_data_permissions() {
   chmod -R u+rwX /data/.local 2>/dev/null || true
 
   log "Perms: ensured /data owned by ${uid}:${gid} and writable."
-}
-
-log_possible_tor_artifacts() {
-  # If onionwrapper/tor wrote anything into /data, capture it for debugging
-  {
-    echo "----- Tor artifacts scan @ $(date -Is) -----"
-    find /data -maxdepth 5 -type f \( -iname "*tor*" -o -iname "*onion*" -o -iname "*log*" \) -print 2>/dev/null || true
-    echo "-------------------------------------------"
-  } >> "$CONTROL_LOG"
 }
 
 hard_wipe_data_dir_except_ui() {
@@ -149,7 +137,6 @@ hard_wipe_data_dir_except_ui() {
     log "RESET: wipe verification PASSED."
   fi
 
-  # Recreate dirs + fix perms (CRITICAL for Tor + onionwrapper)
   mkdir -p /data/.local/share /data/.config /data/.cache
   fix_data_permissions
 
@@ -164,6 +151,94 @@ hard_wipe_data_dir_except_ui() {
   log "RESET: wipe complete."
 }
 
+# ---- Tor/Briar diagnostics (THIS IS THE IMPORTANT ADDITION) ----
+diagnose_tor() {
+  log "DIAG: Briar exited; attempting Tor diagnostics..."
+
+  {
+    echo "===== DIAG @ $(date -Is) ====="
+    echo "uname: $(uname -a || true)"
+    echo "id: $(id || true)"
+    echo "mounts (filtered):"
+    (mount | grep -E ' /data | /tmp | overlay' || true)
+    echo
+    echo "Searching for tor executable under /data..."
+  } >> "$CONTROL_LOG"
+
+  local torbin=""
+  torbin="$(find /data -type f -name tor -perm -u+x 2>/dev/null | head -n 1 || true)"
+
+  if [[ -z "$torbin" ]]; then
+    log "DIAG: no tor executable found under /data yet."
+  else
+    log "DIAG: found tor executable: $torbin"
+    {
+      echo "torbin=$torbin"
+      echo "--- tor --version ---"
+      "$torbin" --version 2>&1 || true
+      echo
+    } >> "$CONTROL_LOG"
+  fi
+
+  {
+    echo "Searching for torrc files under /data..."
+  } >> "$CONTROL_LOG"
+
+  # onionwrapper typically drops a torrc somewhere under XDG dirs
+  local torrcs=""
+  torrcs="$(find /data -type f \( -name "torrc" -o -name "*torrc*" \) 2>/dev/null | head -n 20 || true)"
+
+  if [[ -z "$torrcs" ]]; then
+    log "DIAG: no torrc files found under /data."
+  else
+    log "DIAG: torrc candidates found (see control.log)."
+    {
+      echo "--- torrc candidates (first 20) ---"
+      echo "$torrcs"
+      echo
+    } >> "$CONTROL_LOG"
+
+    if [[ -n "$torbin" ]]; then
+      while IFS= read -r rc; do
+        [[ -n "$rc" ]] || continue
+        {
+          echo "=== torrc: $rc ==="
+          echo "--- head(120) ---"
+          sed -n '1,120p' "$rc" 2>/dev/null || true
+          echo
+          echo "--- tor --verify-config -f $rc ---"
+          timeout 10 "$torbin" --verify-config -f "$rc" 2>&1 || true
+          echo
+        } >> "$CONTROL_LOG"
+      done <<< "$torrcs"
+    fi
+  fi
+
+  # Dump any tor-related logs (best effort)
+  {
+    echo "Searching for tor/onionwrapper log-ish files under /data..."
+    find /data -type f \( -iname "*tor*.log" -o -iname "*onion*.log" -o -iname "*tor*" -o -iname "*onion*" \) \
+      -maxdepth 6 2>/dev/null | head -n 60 || true
+    echo
+    echo "Dumping first 200 lines of any *tor*.log files found..."
+  } >> "$CONTROL_LOG"
+
+  local torlogs=""
+  torlogs="$(find /data -type f -iname "*tor*.log" 2>/dev/null | head -n 10 || true)"
+  if [[ -n "$torlogs" ]]; then
+    while IFS= read -r lf; do
+      [[ -n "$lf" ]] || continue
+      {
+        echo "=== $lf ==="
+        sed -n '1,200p' "$lf" 2>/dev/null || true
+        echo
+      } >> "$CONTROL_LOG"
+    done <<< "$torlogs"
+  fi
+
+  log "DIAG: diagnostics appended to control.log."
+}
+
 # --- UI ---
 cat > "$INDEX" <<'HTML'
 <!doctype html>
@@ -175,7 +250,7 @@ cat > "$INDEX" <<'HTML'
   <style>
     html, body { background:#fff; color:#000; margin:0; padding:0; }
     body { font-family: sans-serif; padding: 16px; }
-    .wrap { max-width: 900px; margin: 0 auto; }
+    .wrap { max-width: 980px; margin: 0 auto; }
     .muted { color:#666; }
     .card { border:1px solid #ddd; border-radius:12px; padding:16px; background:#fff; }
     pre { white-space: pre; overflow-x:auto; background:#f7f7f7; border:1px solid #ddd; border-radius:8px; padding:12px; }
@@ -221,7 +296,7 @@ cat > "$INDEX" <<'HTML'
         try { status = (await loadText("status.txt")).trim(); } catch {}
         const tag = document.getElementById("stateTag");
         const s = (status || "").toUpperCase();
-        if (s.startsWith("CONNECTED")) { tag.className="ok"; tag.textContent="CONNECTED"; }
+        if (s.startsWith("ERROR")) { tag.className="warn"; tag.textContent=status; }
         else if (s.startsWith("RESETTING")) { tag.className="warn"; tag.textContent="RESETTING"; }
         else { tag.className="warn"; tag.textContent = status || "RUNNING"; }
 
@@ -268,8 +343,8 @@ os.chdir(DATA_DIR)
 HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
 PY
 
-python /tmp/server.py >/tmp/http.log 2>&1 &
-log "HTTP server started on :8080. Logs: /tmp/http.log"
+python /tmp/server.py >"$HTTP_LOG" 2>&1 &
+log "HTTP server started on :8080. Logs: $HTTP_LOG"
 
 BriarPID=""
 
@@ -279,11 +354,12 @@ start_briar() {
   log "Starting Briar mailbox..."
   echo "RUNNING" > "$STATUS_TXT"
 
-  # Make sure permissions are sane on every start
   fix_data_permissions
 
+  set +e
   java -jar /app/briar-mailbox.jar 2>&1 | tee -a "$LOG" &
   BriarPID="$!"
+  set -e
   log "Briar PID: $BriarPID"
 }
 
@@ -299,9 +375,9 @@ while true; do
   fi
 
   if ! kill -0 "$BriarPID" 2>/dev/null; then
-    log "Briar exited; restarting..."
-    log_possible_tor_artifacts
-    echo "ERROR: Briar exited" > "$STATUS_TXT"
+    log "Briar exited."
+    echo "ERROR: Briar exited (see control.log)" > "$STATUS_TXT"
+    diagnose_tor
     sleep 2
     start_briar
   fi

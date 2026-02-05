@@ -11,12 +11,12 @@ QR_ASCII="${DATA_DIR}/qr_ascii.txt"
 QR_TXT="${DATA_DIR}/mailbox.txt"
 
 RESET_FLAG="${DATA_DIR}/reset"
+BOOT_MARK="${DATA_DIR}/boot_ts"
 
 mkdir -p "$DATA_DIR"
 
 log() { echo "[$(date -Is)] $*" >&2; }
 
-# Keep container alive if something truly blows up, but show ERROR in UI
 on_err() {
   local rc=$?
   log "FATAL: error on/near line ${BASH_LINENO[0]} (rc=$rc). Keeping container alive."
@@ -32,17 +32,15 @@ export XDG_CONFIG_HOME=/data/.config
 export XDG_CACHE_HOME=/data/.cache
 mkdir -p /data/.local/share /data/.config /data/.cache
 
-# Init files
 : > "$LOG"
 : > "$QR_ASCII"
 : > "$QR_TXT"
 echo "STARTING" > "$STATUS_TXT"
 
-consume_reset_request() {
-  [[ -f "$RESET_FLAG" ]] || return 1
-  rm -f "$RESET_FLAG" 2>/dev/null || true
-  return 0
-}
+# Boot marker so we ignore stale reset flags from previous runs
+date -Is > "$BOOT_MARK"
+# Extra safety: remove stale reset file at boot
+rm -f "$RESET_FLAG" 2>/dev/null || true
 
 fix_data_permissions() {
   local uid gid
@@ -113,8 +111,9 @@ wipe_data_dir_preserve_ui() {
   : > "$QR_ASCII"
   : > "$QR_TXT"
 
+  # Remove everything except the UI/status artifacts
   find /data -mindepth 1 \
-    \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/qr_ascii.txt" -o -path "/data/mailbox.txt" \) -prune -o \
+    \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/qr_ascii.txt" -o -path "/data/mailbox.txt" -o -path "/data/boot_ts" \) -prune -o \
     -exec rm -rf {} + || true
 
   mkdir -p /data/.local/share /data/.config /data/.cache
@@ -124,7 +123,6 @@ wipe_data_dir_preserve_ui() {
   echo "STARTING" > "$STATUS_TXT"
 }
 
-# --- Log parsing / state ---
 extract_ascii_qr() {
   awk '
     BEGIN {inside=0}
@@ -166,7 +164,6 @@ tor_bootstrapped() {
 
 write_status() {
   local s="$1"
-  # Avoid noisy rewrites unless it changed
   local cur=""
   cur="$(cat "$STATUS_TXT" 2>/dev/null || true)"
   if [[ "$cur" != "$s" ]]; then
@@ -175,7 +172,19 @@ write_status() {
   fi
 }
 
-# --- Clean UI page (connected vs pairing) ---
+# Only consume reset if it was created AFTER this boot marker
+consume_reset_request() {
+  [[ -f "$RESET_FLAG" ]] || return 1
+  # If reset file is older than boot mark, ignore it (stale)
+  if [[ "$RESET_FLAG" -ot "$BOOT_MARK" ]]; then
+    rm -f "$RESET_FLAG" 2>/dev/null || true
+    return 1
+  fi
+  rm -f "$RESET_FLAG" 2>/dev/null || true
+  return 0
+}
+
+# --- UI ---
 cat > "$INDEX" <<'HTML'
 <!doctype html>
 <html>
@@ -304,7 +313,6 @@ cat > "$INDEX" <<'HTML'
 </html>
 HTML
 
-# --- web server: GET /reset drops marker then redirects back ---
 cat > /tmp/server.py <<'PY'
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 import os, time
@@ -355,17 +363,14 @@ start_briar() {
   log "Briar PID: $BriarPID"
 }
 
-# Background watcher keeps UI truthful
 watch_state() {
   while true; do
-    # Briar dead?
     if [[ -n "${BriarPID:-}" ]] && ! kill -0 "$BriarPID" 2>/dev/null; then
       write_status "ERROR"
       sleep 1
       continue
     fi
 
-    # Pairing signals win if present
     if saw_pairing_prompt; then
       write_status "PAIRING"
       update_pairing_url
@@ -374,17 +379,14 @@ watch_state() {
       continue
     fi
 
-    # Connected when Tor 100% and no pairing prompts
     if tor_bootstrapped; then
       write_status "CONNECTED"
-      # Hide pairing artifacts (defense-in-depth)
       : > "$QR_ASCII"
       : > "$QR_TXT"
       sleep 3
       continue
     fi
 
-    # Default
     write_status "STARTING"
     sleep 2
   done
@@ -392,7 +394,6 @@ watch_state() {
 
 start_briar
 watch_state &
-WATCH_PID="$!"
 
 while true; do
   if consume_reset_request; then
@@ -402,7 +403,6 @@ while true; do
     start_briar
   fi
 
-  # If Briar crashes, restart it and let watcher update status
   if [[ -n "${BriarPID:-}" ]] && ! kill -0 "$BriarPID" 2>/dev/null; then
     log "Briar exited; restarting..."
     start_briar

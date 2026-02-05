@@ -8,6 +8,7 @@ QR_TXT="${DATA_DIR}/mailbox.txt"
 QR_ASCII="${DATA_DIR}/qr_ascii.txt"
 STATUS_TXT="${DATA_DIR}/status.txt"
 CONNECTED_FLAG="${DATA_DIR}/connected"   # persists across restarts
+RESET_FLAG="${DATA_DIR}/reset"           # create this file to force re-pairing
 HTTP_LOG="/tmp/http.log"
 
 mkdir -p "$DATA_DIR"
@@ -19,6 +20,27 @@ export XDG_DATA_HOME=/data/.local/share
 export XDG_CONFIG_HOME=/data/.config
 export XDG_CACHE_HOME=/data/.cache
 mkdir -p /data/.local/share /data/.config /data/.cache
+
+# Reset option:
+# Create /data/reset (empty file is fine), then restart the add-on.
+# This will wipe Briar's persisted state under /data and force a new pairing QR/URL.
+if [[ -f "$RESET_FLAG" ]]; then
+  echo "RESET requested via $RESET_FLAG — wiping Briar state to force re-pairing..."
+
+  # Clear UI state + pairing artifacts
+  rm -f "$CONNECTED_FLAG" 2>/dev/null || true
+  : > "$QR_TXT"
+  : > "$QR_ASCII"
+  echo "RESETTING" > "$STATUS_TXT"
+
+  # Wipe Briar state (because HOME/XDG_* point to /data)
+  rm -rf /data/.local/share/* /data/.config/* /data/.cache/* 2>/dev/null || true
+
+  # Remove the reset flag so it only runs once
+  rm -f "$RESET_FLAG" 2>/dev/null || true
+
+  echo "RESET complete. Starting fresh..."
+fi
 
 # Placeholders so Ingress never 404s
 : > "$QR_TXT"
@@ -208,7 +230,7 @@ for i in $(seq 1 60); do
     break
   fi
 
-  # If we ever see pairing prompts, we are NOT connected anymore (reset case)
+  # If we ever see pairing prompts, we are NOT connected anymore (reset/re-pair case)
   if saw_pairing_prompt; then
     mark_pairing
     update_pairing_url

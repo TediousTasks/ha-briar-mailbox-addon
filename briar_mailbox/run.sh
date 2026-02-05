@@ -21,6 +21,7 @@ export HOME=/data
 export XDG_DATA_HOME=/data/.local/share
 export XDG_CONFIG_HOME=/data/.config
 export XDG_CACHE_HOME=/data/.cache
+
 mkdir -p /data/.local/share /data/.config /data/.cache
 
 : > "$LOG"
@@ -34,7 +35,7 @@ log() {
 }
 
 update_briar_tail() {
-  tail -n 200 "$LOG" > "$BRIAR_TAIL" 2>/dev/null || true
+  tail -n 250 "$LOG" > "$BRIAR_TAIL" 2>/dev/null || true
 }
 
 consume_reset_request() {
@@ -46,14 +47,14 @@ consume_reset_request() {
 dump_data_tree_to_control() {
   {
     echo "----- /data tree @ $(date -Is) -----"
+    echo "whoami=$(whoami 2>/dev/null || true) uid=$(id -u) gid=$(id -g)"
     ls -la /data || true
     echo
-    find /data -maxdepth 2 -print 2>/dev/null || true
+    find /data -maxdepth 3 -print 2>/dev/null || true
     echo "-----------------------------------"
   } >> "$CONTROL_LOG"
 }
 
-# IMPORTANT: don’t ever block forever trying to stop Java.
 stop_briar_hard() {
   local pid="$1"
   [[ -n "$pid" ]] || return 0
@@ -66,7 +67,6 @@ stop_briar_hard() {
   log "Stop: sending SIGTERM to $pid..."
   kill "$pid" 2>/dev/null || true
 
-  # wait up to 5 seconds
   for _ in $(seq 1 10); do
     if ! kill -0 "$pid" 2>/dev/null; then
       log "Stop: PID $pid exited after SIGTERM."
@@ -78,7 +78,6 @@ stop_briar_hard() {
   log "Stop: still running; sending SIGKILL to $pid..."
   kill -9 "$pid" 2>/dev/null || true
 
-  # wait up to 5 more seconds
   for _ in $(seq 1 10); do
     if ! kill -0 "$pid" 2>/dev/null; then
       log "Stop: PID $pid exited after SIGKILL."
@@ -87,8 +86,34 @@ stop_briar_hard() {
     sleep 0.5
   done
 
-  log "Stop: WARNING: PID $pid still appears alive after SIGKILL (unexpected). Continuing anyway."
-  return 0
+  log "Stop: WARNING: PID $pid still appears alive after SIGKILL. Continuing anyway."
+}
+
+fix_data_permissions() {
+  local uid gid
+  uid="$(id -u)"
+  gid="$(id -g)"
+
+  # Make sure base dirs exist
+  mkdir -p /data/.local/share /data/.config /data/.cache
+
+  # Ensure writable for the running user
+  chown -R "${uid}:${gid}" /data 2>/dev/null || true
+
+  chmod 755 /data 2>/dev/null || true
+  chmod 700 /data/.config /data/.cache 2>/dev/null || true
+  chmod -R u+rwX /data/.local 2>/dev/null || true
+
+  log "Perms: ensured /data owned by ${uid}:${gid} and writable."
+}
+
+log_possible_tor_artifacts() {
+  # If onionwrapper/tor wrote anything into /data, capture it for debugging
+  {
+    echo "----- Tor artifacts scan @ $(date -Is) -----"
+    find /data -maxdepth 5 -type f \( -iname "*tor*" -o -iname "*onion*" -o -iname "*log*" \) -print 2>/dev/null || true
+    echo "-------------------------------------------"
+  } >> "$CONTROL_LOG"
 }
 
 hard_wipe_data_dir_except_ui() {
@@ -124,8 +149,9 @@ hard_wipe_data_dir_except_ui() {
     log "RESET: wipe verification PASSED."
   fi
 
-  # Recreate dirs Briar expects (since we wipe hard)
+  # Recreate dirs + fix perms (CRITICAL for Tor + onionwrapper)
   mkdir -p /data/.local/share /data/.config /data/.cache
+  fix_data_permissions
 
   : > "$LOG"
   : > "$BRIAR_TAIL"
@@ -163,7 +189,7 @@ cat > "$INDEX" <<'HTML'
 <body>
   <div class="wrap">
     <h2>Briar Mailbox</h2>
-    <p class="muted">Refresh to update. Reset forces a new pairing state by wiping /data.</p>
+    <p class="muted">Refresh to update. Reset wipes /data state and requires pairing again.</p>
 
     <div class="card">
       <div class="row">
@@ -242,8 +268,8 @@ os.chdir(DATA_DIR)
 HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
 PY
 
-python /tmp/server.py >"$HTTP_LOG" 2>&1 &
-log "HTTP server started on :8080. Logs: $HTTP_LOG"
+python /tmp/server.py >/tmp/http.log 2>&1 &
+log "HTTP server started on :8080. Logs: /tmp/http.log"
 
 BriarPID=""
 
@@ -252,6 +278,10 @@ start_briar() {
   update_briar_tail
   log "Starting Briar mailbox..."
   echo "RUNNING" > "$STATUS_TXT"
+
+  # Make sure permissions are sane on every start
+  fix_data_permissions
+
   java -jar /app/briar-mailbox.jar 2>&1 | tee -a "$LOG" &
   BriarPID="$!"
   log "Briar PID: $BriarPID"
@@ -270,6 +300,7 @@ while true; do
 
   if ! kill -0 "$BriarPID" 2>/dev/null; then
     log "Briar exited; restarting..."
+    log_possible_tor_artifacts
     echo "ERROR: Briar exited" > "$STATUS_TXT"
     sleep 2
     start_briar

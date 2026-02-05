@@ -37,6 +37,12 @@ cat > "$INDEX" <<'HTML'
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Briar Mailbox QR</title>
   <style>
+    html, body {
+      background: #ffffff;
+      color: #000000;
+      margin: 0;
+      padding: 0;
+    }
     body { font-family: sans-serif; padding: 16px; }
     .wrap { max-width: 760px; margin: 0 auto; }
     .muted { color: #666; }
@@ -51,16 +57,10 @@ cat > "$INDEX" <<'HTML'
     <h2>Briar Mailbox</h2>
     <p class="muted">This page refreshes every 2 seconds.</p>
 
-    <h3>QR (exactly from Briar log)</h3>
-    <div class="qrframe">
-      <img id="qrimg" src="qr.png" alt="QR">
-    </div>
-
+    <h3>Captured ASCII</h3>
+    <pre id="ascii">(waiting...)</pre>
     <h3>Desktop link</h3>
     <code id="link">(waiting...)</code>
-
-    <h3>Captured ASCII (debug)</h3>
-    <pre id="ascii">(waiting...)</pre>
 
     <script>
       async function refresh() {

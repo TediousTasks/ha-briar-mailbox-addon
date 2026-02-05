@@ -7,14 +7,12 @@ HTTP_LOG="/tmp/http.log"
 
 INDEX="${DATA_DIR}/index.html"
 STATUS_TXT="${DATA_DIR}/status.txt"
-BRIAR_TAIL="${DATA_DIR}/briar_tail.txt"
-CONTROL_LOG="${DATA_DIR}/control.log"
+QR_ASCII="${DATA_DIR}/qr_ascii.txt"
+QR_TXT="${DATA_DIR}/mailbox.txt"
 
-CONNECTED_FLAG="${DATA_DIR}/connected"
 RESET_FLAG="${DATA_DIR}/reset"
 
 mkdir -p "$DATA_DIR"
-touch "$CONTROL_LOG"
 
 # Force Briar to use /data (not /root)
 export HOME=/data
@@ -24,17 +22,12 @@ export XDG_CACHE_HOME=/data/.cache
 mkdir -p /data/.local/share /data/.config /data/.cache
 
 : > "$LOG"
-: > "$BRIAR_TAIL"
+: > "$QR_ASCII"
+: > "$QR_TXT"
 echo "STARTING" > "$STATUS_TXT"
 
 log() {
-  local msg="[$(date -Is)] $*"
-  echo "$msg" >&2
-  echo "$msg" >> "$CONTROL_LOG"
-}
-
-update_briar_tail() {
-  tail -n 300 "$LOG" > "$BRIAR_TAIL" 2>/dev/null || true
+  echo "[$(date -Is)] $*" >&2
 }
 
 consume_reset_request() {
@@ -43,49 +36,31 @@ consume_reset_request() {
   return 0
 }
 
-dump_data_tree_to_control() {
-  {
-    echo "----- /data tree @ $(date -Is) -----"
-    echo "whoami=$(whoami 2>/dev/null || true) uid=$(id -u) gid=$(id -g)"
-    ls -la /data || true
-    echo
-    find /data -maxdepth 4 -print 2>/dev/null || true
-    echo "-----------------------------------"
-  } >> "$CONTROL_LOG"
-}
-
 stop_briar_hard() {
   local pid="${1:-}"
   [[ -n "$pid" ]] || return 0
-
   if ! kill -0 "$pid" 2>/dev/null; then
-    log "Stop: Briar PID $pid not running."
     return 0
   fi
 
-  log "Stop: sending SIGTERM to $pid..."
+  log "Stop: SIGTERM $pid"
   kill "$pid" 2>/dev/null || true
 
   for _ in $(seq 1 10); do
     if ! kill -0 "$pid" 2>/dev/null; then
-      log "Stop: PID $pid exited after SIGTERM."
       return 0
     fi
     sleep 0.5
   done
 
-  log "Stop: still running; sending SIGKILL to $pid..."
+  log "Stop: SIGKILL $pid"
   kill -9 "$pid" 2>/dev/null || true
-
   for _ in $(seq 1 10); do
     if ! kill -0 "$pid" 2>/dev/null; then
-      log "Stop: PID $pid exited after SIGKILL."
       return 0
     fi
     sleep 0.5
   done
-
-  log "Stop: WARNING: PID $pid still appears alive after SIGKILL. Continuing anyway."
 }
 
 fix_data_permissions() {
@@ -94,152 +69,73 @@ fix_data_permissions() {
   gid="$(id -g)"
 
   mkdir -p /data/.local/share /data/.config /data/.cache
-
   chown -R "${uid}:${gid}" /data 2>/dev/null || true
-
   chmod 755 /data 2>/dev/null || true
   chmod 700 /data/.config /data/.cache 2>/dev/null || true
   chmod -R u+rwX /data/.local 2>/dev/null || true
-
-  log "Perms: ensured /data owned by ${uid}:${gid} and writable."
 }
 
-hard_wipe_data_dir_except_ui() {
-  log "RESET: dumping /data BEFORE wipe..."
-  dump_data_tree_to_control
-
-  log "RESET: wiping /data (preserve UI files only)..."
+wipe_data_dir_preserve_ui() {
   echo "RESETTING" > "$STATUS_TXT"
 
-  rm -f "$CONNECTED_FLAG" 2>/dev/null || true
   : > "$LOG"
-  update_briar_tail
+  : > "$QR_ASCII"
+  : > "$QR_TXT"
 
-  : > /tmp/reset_rm_err.log
-
-  # Preserve allowlist: index.html, status.txt, briar_tail.txt, control.log
+  # Preserve allowlist: index.html, status.txt, qr_ascii.txt, mailbox.txt
   find /data -mindepth 1 \
-    \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/briar_tail.txt" -o -path "/data/control.log" \) -prune -o \
-    -exec rm -rf {} + 2>>/tmp/reset_rm_err.log || true
-
-  leftover="$(find /data -mindepth 1 \
-    \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/briar_tail.txt" -o -path "/data/control.log" \) -prune -o \
-    -print | head -n 200 || true)"
-
-  if [[ -n "$leftover" ]]; then
-    log "RESET WARNING: leftover items after wipe (first 200):"
-    echo "$leftover" >> "$CONTROL_LOG"
-    if [[ -s /tmp/reset_rm_err.log ]]; then
-      log "RESET rm errors (first 200 lines):"
-      sed -n '1,200p' /tmp/reset_rm_err.log >> "$CONTROL_LOG" || true
-    fi
-  else
-    log "RESET: wipe verification PASSED."
-  fi
+    \( -path "/data/index.html" -o -path "/data/status.txt" -o -path "/data/qr_ascii.txt" -o -path "/data/mailbox.txt" \) -prune -o \
+    -exec rm -rf {} + || true
 
   mkdir -p /data/.local/share /data/.config /data/.cache
   fix_data_permissions
 
-  : > "$LOG"
-  : > "$BRIAR_TAIL"
-  update_briar_tail
-
-  log "RESET: dumping /data AFTER wipe..."
-  dump_data_tree_to_control
-
   echo "STARTING" > "$STATUS_TXT"
-  log "RESET: wipe complete."
 }
 
-# ---- Tor/Briar diagnostics (THIS IS THE IMPORTANT ADDITION) ----
-diagnose_tor() {
-  log "DIAG: Briar exited; attempting Tor diagnostics..."
+# --- State detection from log ---
+extract_ascii_qr() {
+  awk '
+    BEGIN {inside=0}
+    /Please scan this with the Briar Android app:/ {inside=1; next}
+    /Or copy and paste this into Briar Desktop:/ {inside=0}
+    inside==1 {print}
+  ' "$LOG" > "$QR_ASCII" 2>/dev/null || true
 
-  {
-    echo "===== DIAG @ $(date -Is) ====="
-    echo "uname: $(uname -a || true)"
-    echo "id: $(id || true)"
-    echo "mounts (filtered):"
-    (mount | grep -E ' /data | /tmp | overlay' || true)
-    echo
-    echo "Searching for tor executable under /data..."
-  } >> "$CONTROL_LOG"
-
-  local torbin=""
-  torbin="$(find /data -type f -name tor -perm -u+x 2>/dev/null | head -n 1 || true)"
-
-  if [[ -z "$torbin" ]]; then
-    log "DIAG: no tor executable found under /data yet."
-  else
-    log "DIAG: found tor executable: $torbin"
-    {
-      echo "torbin=$torbin"
-      echo "--- tor --version ---"
-      "$torbin" --version 2>&1 || true
-      echo
-    } >> "$CONTROL_LOG"
-  fi
-
-  {
-    echo "Searching for torrc files under /data..."
-  } >> "$CONTROL_LOG"
-
-  # onionwrapper typically drops a torrc somewhere under XDG dirs
-  local torrcs=""
-  torrcs="$(find /data -type f \( -name "torrc" -o -name "*torrc*" \) 2>/dev/null | head -n 20 || true)"
-
-  if [[ -z "$torrcs" ]]; then
-    log "DIAG: no torrc files found under /data."
-  else
-    log "DIAG: torrc candidates found (see control.log)."
-    {
-      echo "--- torrc candidates (first 20) ---"
-      echo "$torrcs"
-      echo
-    } >> "$CONTROL_LOG"
-
-    if [[ -n "$torbin" ]]; then
-      while IFS= read -r rc; do
-        [[ -n "$rc" ]] || continue
-        {
-          echo "=== torrc: $rc ==="
-          echo "--- head(120) ---"
-          sed -n '1,120p' "$rc" 2>/dev/null || true
-          echo
-          echo "--- tor --verify-config -f $rc ---"
-          timeout 10 "$torbin" --verify-config -f "$rc" 2>&1 || true
-          echo
-        } >> "$CONTROL_LOG"
-      done <<< "$torrcs"
-    fi
-  fi
-
-  # Dump any tor-related logs (best effort)
-  {
-    echo "Searching for tor/onionwrapper log-ish files under /data..."
-    find /data -type f \( -iname "*tor*.log" -o -iname "*onion*.log" -o -iname "*tor*" -o -iname "*onion*" \) \
-      -maxdepth 6 2>/dev/null | head -n 60 || true
-    echo
-    echo "Dumping first 200 lines of any *tor*.log files found..."
-  } >> "$CONTROL_LOG"
-
-  local torlogs=""
-  torlogs="$(find /data -type f -iname "*tor*.log" 2>/dev/null | head -n 10 || true)"
-  if [[ -n "$torlogs" ]]; then
-    while IFS= read -r lf; do
-      [[ -n "$lf" ]] || continue
-      {
-        echo "=== $lf ==="
-        sed -n '1,200p' "$lf" 2>/dev/null || true
-        echo
-      } >> "$CONTROL_LOG"
-    done <<< "$torlogs"
-  fi
-
-  log "DIAG: diagnostics appended to control.log."
+  python - <<'PY'
+from pathlib import Path
+p = Path("/data/qr_ascii.txt")
+try:
+    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+except Exception:
+    lines = []
+while lines and not lines[0].strip():
+    lines.pop(0)
+while lines and not lines[-1].strip():
+    lines.pop()
+p.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+PY
 }
 
-# --- UI ---
+update_pairing_url() {
+  local url
+  url="$(grep -Eo 'briar-mailbox://[^[:space:]]+' "$LOG" | tail -n 1 || true)"
+  if [[ -n "$url" ]]; then
+    echo "$url" > "$QR_TXT"
+  fi
+}
+
+saw_pairing_prompt() {
+  grep -q "Please scan this with the Briar Android app:" "$LOG" \
+  || grep -q "Or copy and paste this into Briar Desktop:" "$LOG" \
+  || grep -Eqo 'briar-mailbox://[^[:space:]]+' "$LOG"
+}
+
+tor_bootstrapped() {
+  grep -q "Bootstrapped 100% (done): Done" "$LOG"
+}
+
+# --- Clean UI ---
 cat > "$INDEX" <<'HTML'
 <!doctype html>
 <html>
@@ -250,61 +146,105 @@ cat > "$INDEX" <<'HTML'
   <style>
     html, body { background:#fff; color:#000; margin:0; padding:0; }
     body { font-family: sans-serif; padding: 16px; }
-    .wrap { max-width: 980px; margin: 0 auto; }
+    .wrap { max-width: 760px; margin: 0 auto; }
     .muted { color:#666; }
     .card { border:1px solid #ddd; border-radius:12px; padding:16px; background:#fff; }
     pre { white-space: pre; overflow-x:auto; background:#f7f7f7; border:1px solid #ddd; border-radius:8px; padding:12px; }
-    .ok { display:inline-block; padding:6px 10px; border-radius:999px; background:#e9f7ef; border:1px solid #bfe8cf; }
-    .warn { display:inline-block; padding:6px 10px; border-radius:999px; background:#fff6e5; border:1px solid #ffe0a3; }
+    code { word-break: break-all; display:block; padding:12px; border:1px solid #ddd; border-radius:8px; background:#f7f7f7; }
+    .tag { display:inline-block; padding:6px 10px; border-radius:999px; border:1px solid #ddd; background:#f7f7f7; }
+    .tag.ok { background:#e9f7ef; border-color:#bfe8cf; }
+    .tag.warn { background:#fff6e5; border-color:#ffe0a3; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:10px; }
     .btn { display:inline-block; padding:10px 12px; border:1px solid #ccc; border-radius:10px; background:#f7f7f7; text-decoration:none; color:#000; cursor:pointer; }
     .btn-danger { border-color:#f1b0b7; background:#fff0f2; }
-    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h2>Briar Mailbox</h2>
-    <p class="muted">Refresh to update. Reset wipes /data state and requires pairing again.</p>
+    <p class="muted">If pairing is shown, click Refresh after a few seconds to update.</p>
 
     <div class="card">
       <div class="row">
-        <div id="stateTag" class="warn">Loading…</div>
+        <div id="stateTag" class="tag warn">Loading…</div>
         <a class="btn" href="./">Refresh</a>
         <a class="btn btn-danger" href="reset" id="resetLink">Reset</a>
       </div>
 
-      <h3>Control log</h3>
-      <pre id="ctl">(loading...)</pre>
+      <div id="connectedBlock" style="display:none; margin-top:14px;">
+        <h3>Connected</h3>
+        <p class="muted">This mailbox appears to already be configured.</p>
+      </div>
 
-      <h3>Briar log tail</h3>
-      <pre id="tail">(loading...)</pre>
+      <div id="pairBlock" style="display:none; margin-top:14px;">
+        <h3>Pairing</h3>
+        <p class="muted">Scan the ASCII QR in the Briar Android app, or copy the desktop link.</p>
+
+        <h4>ASCII QR</h4>
+        <pre id="ascii">(waiting...)</pre>
+
+        <h4>Desktop link</h4>
+        <code id="link">(waiting...)</code>
+      </div>
+
+      <div id="startingBlock" style="display:none; margin-top:14px;">
+        <h3>Starting</h3>
+        <p class="muted">Briar is starting up. Refresh in a few seconds.</p>
+      </div>
     </div>
 
     <script>
       document.getElementById("resetLink").addEventListener("click", (e) => {
-        if (!confirm("Reset now? This wipes /data state and requires pairing again.")) e.preventDefault();
+        if (!confirm("Reset now? This wipes /data and requires pairing again.")) e.preventDefault();
       });
 
       async function loadText(path) {
         const r = await fetch(path, { cache: 'no-store' });
         if (!r.ok) throw new Error(path + " " + r.status);
-        return await r.text();
+        return (await r.text()).trim();
       }
 
       (async () => {
         let status = "STARTING";
-        try { status = (await loadText("status.txt")).trim(); } catch {}
+        try { status = await loadText("status.txt"); } catch {}
+
         const tag = document.getElementById("stateTag");
+        const connected = document.getElementById("connectedBlock");
+        const pairing = document.getElementById("pairBlock");
+        const starting = document.getElementById("startingBlock");
+
         const s = (status || "").toUpperCase();
-        if (s.startsWith("ERROR")) { tag.className="warn"; tag.textContent=status; }
-        else if (s.startsWith("RESETTING")) { tag.className="warn"; tag.textContent="RESETTING"; }
-        else { tag.className="warn"; tag.textContent = status || "RUNNING"; }
 
-        try { document.getElementById("ctl").textContent = (await loadText("control.log")).trim() || "(empty)"; }
-        catch { document.getElementById("ctl").textContent="(error loading control.log)"; }
+        function show(which) {
+          connected.style.display = which === "connected" ? "block" : "none";
+          pairing.style.display   = which === "pairing"   ? "block" : "none";
+          starting.style.display  = which === "starting"  ? "block" : "none";
+        }
 
-        try { document.getElementById("tail").textContent = (await loadText("briar_tail.txt")).trim() || "(empty)"; }
-        catch { document.getElementById("tail").textContent="(error loading briar_tail.txt)"; }
+        if (s.startsWith("CONNECTED")) {
+          tag.className = "tag ok";
+          tag.textContent = "CONNECTED";
+          show("connected");
+          return;
+        }
+
+        if (s.startsWith("PAIRING")) {
+          tag.className = "tag warn";
+          tag.textContent = "PAIRING";
+          show("pairing");
+
+          try { document.getElementById("ascii").textContent = await loadText("qr_ascii.txt") || "(waiting...)"; }
+          catch { document.getElementById("ascii").textContent = "(error loading qr_ascii.txt)"; }
+
+          try { document.getElementById("link").textContent = await loadText("mailbox.txt") || "(waiting...)"; }
+          catch { document.getElementById("link").textContent = "(error loading mailbox.txt)"; }
+
+          return;
+        }
+
+        tag.className = "tag warn";
+        tag.textContent = status || "STARTING";
+        show("starting");
       })();
     </script>
   </div>
@@ -350,38 +290,95 @@ BriarPID=""
 
 start_briar() {
   : > "$LOG"
-  update_briar_tail
-  log "Starting Briar mailbox..."
-  echo "RUNNING" > "$STATUS_TXT"
+  : > "$QR_ASCII"
+  : > "$QR_TXT"
+  echo "STARTING" > "$STATUS_TXT"
 
   fix_data_permissions
 
-  set +e
+  log "Starting Briar mailbox..."
   java -jar /app/briar-mailbox.jar 2>&1 | tee -a "$LOG" &
   BriarPID="$!"
-  set -e
   log "Briar PID: $BriarPID"
 }
 
-start_briar
+# Decide CONNECTED vs PAIRING based on logs
+decide_state_window() {
+  # Wait up to ~60 seconds to decide initial state
+  for _ in $(seq 1 60); do
+    if ! kill -0 "$BriarPID" 2>/dev/null; then
+      echo "ERROR" > "$STATUS_TXT"
+      return 0
+    fi
 
+    if saw_pairing_prompt; then
+      echo "PAIRING" > "$STATUS_TXT"
+      update_pairing_url
+      extract_ascii_qr
+      return 0
+    fi
+
+    if tor_bootstrapped; then
+      echo "CONNECTED" > "$STATUS_TXT"
+      return 0
+    fi
+
+    sleep 1
+  done
+
+  # If undecided, keep STARTING
+  echo "STARTING" > "$STATUS_TXT"
+}
+
+start_briar
+decide_state_window
+
+# Main loop:
+# - handle reset
+# - keep Briar running
+# - if in PAIRING, keep QR + URL updated
 while true; do
   if consume_reset_request; then
-    log "RESET: request consumed; stopping Briar..."
+    log "RESET: requested"
     stop_briar_hard "$BriarPID"
-    hard_wipe_data_dir_except_ui
-    log "RESET: restarting Briar..."
+    wipe_data_dir_preserve_ui
     start_briar
+    decide_state_window
   fi
 
+  # If Briar died, restart and re-decide
   if ! kill -0 "$BriarPID" 2>/dev/null; then
-    log "Briar exited."
-    echo "ERROR: Briar exited (see control.log)" > "$STATUS_TXT"
-    diagnose_tor
-    sleep 2
+    log "Briar exited; restarting"
     start_briar
+    decide_state_window
   fi
 
-  update_briar_tail
+  # If pairing, keep extracting so refresh shows latest
+  if grep -q "^PAIRING" "$STATUS_TXT"; then
+    update_pairing_url
+    extract_ascii_qr
+
+    # If prompts disappear and tor is fully up, flip to connected after ~10s stable
+    stable=0
+    for _ in $(seq 1 10); do
+      if ! kill -0 "$BriarPID" 2>/dev/null; then
+        stable=0
+        break
+      fi
+      if ! saw_pairing_prompt && tor_bootstrapped; then
+        stable=$((stable + 1))
+      else
+        stable=0
+      fi
+      sleep 1
+    done
+
+    if [[ "$stable" -ge 10 ]]; then
+      echo "CONNECTED" > "$STATUS_TXT"
+      : > "$QR_ASCII"
+      : > "$QR_TXT"
+    fi
+  fi
+
   sleep 2
 done

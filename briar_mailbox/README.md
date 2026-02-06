@@ -12,51 +12,12 @@ While this is great for privacy (no central server which
 can log things or be censored) it's bad for reachability, especially in
 mobile networks where connectivity can be limited.
 
-```mermaid
-graph LR
- A[Alice]
- B[Bob]
- A1[Alice]
- B1[Bob]
- style B fill:#8db600
- style A1 fill:#8db600
- subgraph Alice offline
- B-. can't send message .-> A
- end
- subgraph Bob offline
- B1-. can't send message .-> A1
- end
-```
-
 Message delivery could be delayed for an arbitrary time (or even indefinitely) 
 until both Bob and Alice are online at the same time.  
 The mailbox solves this problem by providing 
 a message buffer where contacts can leave messages for the owner 
 of the mailbox and which is connected to a stable internet connection 
 (e.g. the wifi at home, cable internet) and a power source.
- 
-
-```mermaid
-graph LR
-  A[Alice]
-  A1[Alice]
-  B[Bob]
-  B1[Bob]
-  RA["Mailbox (always online)"]
-  style B fill:#8db600
-  style RA fill:#8db600
-  style A1 fill:#8db600
-  subgraph Alice offline
-  B-. can't send message .-> A
-  end
-  subgraph Alice's Mailbox
-  B-- send message --> RA
-  end
-  subgraph Alice online
-  B1-. can't send message .-> A1
-  A1-- get message --> RA
-  end
-```
 
 ## Hardware
 

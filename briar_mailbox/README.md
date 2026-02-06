@@ -99,7 +99,7 @@ This uses the fat JAR for running on a x86_64 GNU/Linux server compiled with
   && mkdir -p /out \
   && cp mailbox-cli/build/libs/mailbox-cli-linux-x86_64.jar /out/briar-mailbox.jar
 ```
-## Donate 
+## Donate to the Briar Project (not to me)
 [![Donate using Liberapay](https://briarproject.org/img/liberapay.svg)](https://liberapay.com/Briar/donate) [![Flattr this](https://briarproject.org/img/flattr-badge-large.png "Flattr this")](https://flattr.com/t/592836/)   
 Bitcoin and BCH: 1NZCKkUCtJV2U2Y9hDb9uq8S7ksFCFGR6K
 

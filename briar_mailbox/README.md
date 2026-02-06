@@ -1,6 +1,6 @@
 # Briar Mailbox Home Assistant App (add-on)
 
-##(Taken from the briar-mailbox README.md. I did not create the Briar Project and I have no affliation with them.)
+## (Taken from the briar-mailbox README.md. I did not create the Briar Project and I have no affliation with them.)
 
 This project aims to develop an easy way for Briar users to increase their 
 reachability and lower the battery drain of their phone.

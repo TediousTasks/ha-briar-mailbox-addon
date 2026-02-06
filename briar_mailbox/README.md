@@ -51,7 +51,7 @@ any hardware supporting Java (e.g. unix server, raspberry pi) could be added.
 
 [briarproject.org](https://briarproject.org/)
 
-## The Briar Mailbox Home Assistant App is Built from the Briar Mailbox Server CLI version
+## The Briar Mailbox Home Assistant App is built from the Briar Mailbox Server CLI version
 
 This uses the fat JAR for running on a x86_64 GNU/Linux server compiled with
 ```

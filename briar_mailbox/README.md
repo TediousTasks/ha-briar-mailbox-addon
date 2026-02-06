@@ -1,6 +1,6 @@
 # Briar Mailbox Home Assistant App (add-on)
 
-(Taken from the briar-mailbox README.md. I did not create the Briar Project and I have no affliation with them.)
+##(Taken from the briar-mailbox README.md. I did not create the Briar Project and I have no affliation with them.)
 
 This project aims to develop an easy way for Briar users to increase their 
 reachability and lower the battery drain of their phone.
@@ -90,7 +90,7 @@ any hardware supporting Java (e.g. unix server, raspberry pi) could be added.
 
 [briarproject.org](https://briarproject.org/)
 
-## Home Assistant App is Built from the Briar Mailbox Server CLI version
+## The Briar Mailbox Home Assistant App is Built from the Briar Mailbox Server CLI version
 
 This uses the fat JAR for running on a x86_64 GNU/Linux server compiled with
 ```

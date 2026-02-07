@@ -23,7 +23,7 @@ of the mailbox and which is connected to a stable internet connection
 
 This Home Assistant App is currently setup to only work with x86_64 architectures as that is what my Home Assistant instance is running.
 
-Howver, here's the hardware infro direct from the Briar Project:
+Howver, here's the hardware info direct from the Briar Project README:
 
 We want the mailbox to be as easy to deploy as possible. The target for this project
 will come as Android application since it will be easy to setup and besides a 
